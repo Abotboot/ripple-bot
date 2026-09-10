@@ -1,0 +1,20 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+ENV/
+
+# Secrets & credentials
+.env
+*.key
+*.pem
+groq_key.txt
+bot_token.txt
+
+# Local data & logs
+meeting_stats.json
+*.log

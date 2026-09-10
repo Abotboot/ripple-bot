@@ -1,0 +1,12 @@
+services:
+  - type: web
+    name: ripple-bot
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: python -u ripple_bot_gateway.py
+    envVars:
+      - key: PORT
+        value: 8080
+      - key: PYTHONUNBUFFERED
+        value: "1"
