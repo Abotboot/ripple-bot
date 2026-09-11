@@ -11,12 +11,12 @@ import water_knowledge
 KEY_FILE = os.path.join(os.path.dirname(__file__), "groq_key.txt")
 
 def get_groq_key():
-    env_key = os.environ.get("GROQ_API_KEY", "").strip()
+    env_key = os.environ.get("GROQ_API_KEY", "").strip().lstrip('\ufeff')
     if env_key:
         return env_key
     if os.path.exists(KEY_FILE):
         try:
-            with open(KEY_FILE, "r", encoding="utf-8") as f:
+            with open(KEY_FILE, "r", encoding="utf-8-sig") as f:
                 k = f.read().strip()
                 if k.startswith("gsk_"):
                     return k

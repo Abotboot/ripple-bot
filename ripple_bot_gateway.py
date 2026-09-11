@@ -39,12 +39,12 @@ import meeting_tracker
 if sys.platform == 'win32':
     sys.stdout.reconfigure(encoding='utf-8')
 
-TOKEN = os.environ.get('DISCORD_BOT_TOKEN', '').strip()
+TOKEN = os.environ.get('DISCORD_BOT_TOKEN', '').strip().lstrip('\ufeff')
 if not TOKEN:
     token_file = os.path.join(os.path.dirname(__file__), "bot_token.txt")
     if os.path.exists(token_file):
         try:
-            with open(token_file, "r") as f:
+            with open(token_file, "r", encoding='utf-8-sig') as f:
                 TOKEN = f.read().strip()
         except Exception:
             pass
@@ -1101,7 +1101,22 @@ async def run_bot():
         raise RuntimeError('DISCORD_BOT_TOKEN is required')
     await start_health_server()
     async with client:
-        await client.start(TOKEN)
+        delay = 300
+        while not client.is_closed():
+            try:
+                await client.start(TOKEN)
+                return
+            except discord.HTTPException as exc:
+                if exc.status != 429 and exc.status < 500:
+                    raise
+                retry_after = exc.response.headers.get('Retry-After', '')
+                try:
+                    wait = max(delay, float(retry_after))
+                except ValueError:
+                    wait = delay
+                logging.warning('Discord login HTTP %s; retrying in %ss. Commands remain unavailable until READY.', exc.status, wait)
+                await asyncio.sleep(wait)
+                delay = min(delay * 2, 900)
 
 if __name__ == '__main__':
     print(f"RippleBot SDK runtime {os.environ.get('RENDER_GIT_COMMIT', 'local')}", flush=True)

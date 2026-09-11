@@ -2,6 +2,8 @@
 import asyncio
 import io
 import json
+import os
+from pathlib import Path
 import tempfile
 import unittest
 import wave
@@ -10,11 +12,19 @@ from unittest.mock import AsyncMock, Mock, patch
 
 import discord
 import meeting_tracker
+import groq_engine
 import ripple_bot_gateway as bot
 from voice_capture import MeetingRecorder
 
 
 class TrackerTests(unittest.TestCase):
+    def test_windows_key_file_accepts_utf8_bom(self):
+        with tempfile.TemporaryDirectory() as tmp, patch.dict(os.environ, {'GROQ_API_KEY': ''}):
+            path = Path(tmp) / 'key.txt'
+            path.write_text('gsk_test_key', encoding='utf-8-sig')
+            with patch.object(groq_engine, 'KEY_FILE', str(path)):
+                self.assertEqual(groq_engine.get_groq_key(), 'gsk_test_key')
+
     def test_mute_does_not_reset_duration_and_end_counts_once(self):
         with tempfile.TemporaryDirectory() as tmp, patch.object(meeting_tracker, 'STATS_FILE', tmp + '/stats.json'):
             tracker = meeting_tracker.MeetingTracker('99', None)
@@ -43,6 +53,16 @@ class TrackerTests(unittest.TestCase):
 
 
 class AsyncTests(unittest.IsolatedAsyncioTestCase):
+    async def test_login_429_waits_instead_of_crashing(self):
+        response = SimpleNamespace(status=429, reason='Too Many Requests', headers={'Retry-After': '600'})
+        fake_client = AsyncMock()
+        fake_client.is_closed = Mock(return_value=False)
+        fake_client.start = AsyncMock(side_effect=[discord.HTTPException(response, 'rate limited'), None])
+        with patch.object(bot, 'TOKEN', 'test'), patch.object(bot, 'client', fake_client), patch.object(bot, 'start_health_server', AsyncMock()), patch.object(bot.asyncio, 'sleep', AsyncMock()) as sleep:
+            await bot.run_bot()
+        sleep.assert_awaited_once_with(600)
+        self.assertEqual(fake_client.start.await_count, 2)
+
     async def test_meeting_deferred_before_work(self):
         order = []
         async def defer(**kwargs):
