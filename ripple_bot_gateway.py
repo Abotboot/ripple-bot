@@ -23,7 +23,6 @@ import time
 import re
 import sys
 import os
-import uuid
 import io
 import logging
 from contextlib import closing
@@ -52,7 +51,6 @@ if not TOKEN:
 
 GUILD_ID = '1545531421081346101'
 BOT_ID = '1546333781764345936'
-BASE_URL = 'https://discord.com/api/v10'
 
 ROLE_MAP = {
     '1546398389401288826': {
@@ -117,12 +115,6 @@ LANG_ALIASES = {
     'sv': 'sv', 'swedish': 'sv',
 }
 
-HEADERS = {
-    'Authorization': f'Bot {TOKEN}',
-    'User-Agent': 'DiscordBot (RippleBot, 1.0)',
-    'Content-Type': 'application/json'
-}
-
 _webhook_cache = {}
 
 async def api_call(endpoint, method='GET', data=None, max_retries=3):
@@ -143,7 +135,6 @@ async def api_call(endpoint, method='GET', data=None, max_retries=3):
     return await client.http.request(route, **kwargs)
 
 tracker = meeting_tracker.MeetingTracker(BOT_ID, api_call)
-_guild_voice_states = {}  # uid -> {'channel_id': cid, 'username': str, 'display_name': str}
 
 
 
@@ -912,7 +903,7 @@ async def start_health_server():
     from aiohttp import web
     async def health(request):
         ready = client.is_ready()
-        return web.json_response({'ready': ready, 'meeting_active': tracker.is_active,
+        return web.json_response({'ready': ready, 'revision': os.environ.get('RENDER_GIT_COMMIT', 'local'), 'meeting_active': tracker.is_active,
                                   'voice': recorder.status() if recorder else 'idle'}, status=200 if ready else 503)
     app = web.Application()
     app.router.add_get('/', health)
@@ -1113,6 +1104,7 @@ async def run_bot():
         await client.start(TOKEN)
 
 if __name__ == '__main__':
+    print(f"RippleBot SDK runtime {os.environ.get('RENDER_GIT_COMMIT', 'local')}", flush=True)
     print("=" * 60)
     print("             🌊 RIPPLEBOT SERVICE (AI-POWERED) 🌊")
     print("=" * 60)

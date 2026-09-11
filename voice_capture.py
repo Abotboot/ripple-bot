@@ -76,6 +76,8 @@ class MeetingRecorder(voice_recv.AudioSink):
             self.accepting = False
 
     async def start(self, channel):
+        # Fail at start if the host lacks libopus, rather than killing the receive thread later.
+        discord.opus.Decoder()
         self.vc = await channel.connect(cls=voice_recv.VoiceRecvClient, timeout=20, reconnect=True, self_deaf=False)
         try:
             self.vc.listen(self)

@@ -3,7 +3,7 @@ services:
     name: ripple-bot
     runtime: python
     plan: free
-    buildCommand: pip install -r requirements.txt
+    buildCommand: pip install -r requirements.txt && python -m unittest -v test_bot
     startCommand: python -u ripple_bot_gateway.py
     envVars:
       - key: PORT
