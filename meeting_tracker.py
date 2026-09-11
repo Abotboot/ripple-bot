@@ -62,15 +62,16 @@ class MeetingTracker:
 
     def _save_stats(self):
         try:
-            with open(STATS_FILE, "w", encoding="utf-8") as f:
+            with open(STATS_FILE + '.tmp', "w", encoding="utf-8") as f:
                 json.dump(self.stats, f, indent=2)
+            os.replace(STATS_FILE + '.tmp', STATS_FILE)
         except Exception as e:
             print(f"[MeetingTracker] Error saving stats: {e}")
 
-    def ensure_reports_channel(self, guild_id: str) -> str:
+    async def ensure_reports_channel(self, guild_id: str) -> str:
         """Finds or creates the #📊｜meeting-reports channel in Founders category."""
         try:
-            channels = self.api_call(f"/guilds/{guild_id}/channels")
+            channels = await self.api_call(f"/guilds/{guild_id}/channels")
             if channels:
                 for c in channels:
                     if "meeting-report" in c.get("name", "").lower() and c.get("parent_id") == FOUNDERS_CATEGORY_ID:
@@ -78,7 +79,7 @@ class MeetingTracker:
                         return self.reports_channel_id
 
             # Create if not found
-            created = self.api_call(f"/guilds/{guild_id}/channels", method="POST", data={
+            created = await self.api_call(f"/guilds/{guild_id}/channels", method="POST", data={
                 "name": "📊｜meeting-reports",
                 "type": 0,
                 "parent_id": FOUNDERS_CATEGORY_ID,
@@ -118,6 +119,8 @@ class MeetingTracker:
                     "currently_in": True
                 }
 
+        if not self.attendees:
+            self.empty_since = self.start_time
         return True, f"🎙️ **Founders Meeting Started!**\nTracking attendance and hours in <#{FOUNDERS_VC_ID}>. Type `/meeting end` or `!meeting end` when done."
 
     def add_transcript(self, speaker: str, text: str):
@@ -126,7 +129,6 @@ class MeetingTracker:
         clean_text = text.strip()
         if clean_text:
             self.transcript_lines.append(f"{speaker}: {clean_text}")
-            print(f"[MeetingTracker] Captured in-meeting note from {speaker}: {clean_text[:60]}")
 
     def on_voice_state_update(self, user_id: str, username: str, display_name: str, old_channel_id: str, new_channel_id: str):
         if not self.is_active:
@@ -134,6 +136,10 @@ class MeetingTracker:
 
         user_id = str(user_id)
         if user_id == self.bot_id:
+            return
+
+        # Muting, deafening and streaming do not restart an attendance interval.
+        if old_channel_id == new_channel_id:
             return
 
         now = time.time()
@@ -180,6 +186,8 @@ class MeetingTracker:
         """Ends current meeting, compiles embed report, updates stats."""
         if not self.is_active:
             return False, None, "⚠️ No active meeting in Founders VC to end."
+
+        self.is_active = False
 
         now = time.time()
         meeting_duration = max(1.0, now - self.start_time)
@@ -307,7 +315,7 @@ class MeetingTracker:
             },
             {
                 "name": f"👥 Attendees ({len(sorted_attendees)})",
-                "value": "\n".join(attendee_lines),
+                "value": "\n".join(attendee_lines)[:1024],
                 "inline": False
             }
         ]
@@ -315,7 +323,7 @@ class MeetingTracker:
         if leaderboard_lines:
             fields.append({
                 "name": "🏆 Cumulative Founders Leaderboard",
-                "value": "\n".join(leaderboard_lines),
+                "value": "\n".join(leaderboard_lines)[:1024],
                 "inline": False
             })
 
@@ -377,7 +385,7 @@ class MeetingTracker:
                 },
                 {
                     "name": "👥 Active Participants",
-                    "value": "\n".join(lines),
+                    "value": "\n".join(lines)[:1024],
                     "inline": False
                 }
             ],
@@ -409,7 +417,7 @@ class MeetingTracker:
             "fields": [
                 {
                     "name": "🏆 Hours Leaderboard",
-                    "value": "\n".join(lines) if lines else "*No member data.*",
+                    "value": "\n".join(lines)[:1024] if lines else "*No member data.*",
                     "inline": False
                 }
             ],

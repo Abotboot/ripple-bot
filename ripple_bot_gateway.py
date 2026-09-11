@@ -24,6 +24,11 @@ import re
 import sys
 import os
 import uuid
+import io
+import logging
+from contextlib import closing
+import discord
+from voice_capture import MeetingRecorder
 
 from deep_translator import GoogleTranslator, MyMemoryTranslator
 import groq_engine
@@ -120,142 +125,50 @@ HEADERS = {
 
 _webhook_cache = {}
 
-def api_call(endpoint, method='GET', data=None, max_retries=3):
-    url = f'{BASE_URL}{endpoint}'
-    payload = json.dumps(data).encode('utf-8') if data is not None else None
-    for attempt in range(max_retries):
-        try:
-            req = urllib.request.Request(url, data=payload, headers=HEADERS, method=method)
-            with urllib.request.urlopen(req, timeout=12) as resp:
-                if resp.status == 204:
-                    return None
-                return json.loads(resp.read().decode('utf-8'))
-        except urllib.error.HTTPError as e:
-            if e.code == 429:
-                retry_after = 1.0
-                try:
-                    err_body = json.loads(e.read().decode('utf-8'))
-                    retry_after = float(err_body.get('retry_after', 1.0))
-                except Exception:
-                    pass
-                print(f"[API] 429 rate limited on {endpoint}. Sleeping {retry_after}s (attempt {attempt+1}/{max_retries})...")
-                time.sleep(retry_after)
-                continue
-            print(f"[API] HTTP {e.code} error on {endpoint}: {e}")
-            raise e
-        except Exception as e:
-            if attempt == max_retries - 1:
-                print(f"[API] Call error on {endpoint}: {e}")
-                raise e
-            time.sleep(0.5)
+async def api_call(endpoint, method='GET', data=None, max_retries=3):
+    path, _, query = endpoint.partition('?')
+    # Preserve Discord's major parameters so rate limits are shared per channel.
+    params = {}
+    parts = path.split('/')
+    if len(parts) > 2 and parts[1] in ('channels', 'guilds'):
+        key = 'channel_id' if parts[1] == 'channels' else 'guild_id'
+        params[key] = parts[2]
+        parts[2] = '{' + key + '}'
+    route = discord.http.Route(method, '/'.join(parts), **params)
+    kwargs = {'params': dict(urllib.parse.parse_qsl(query))} if query else {}
+    if data is not None:
+        kwargs['json'] = dict(data)
+        if 'content' in data or 'embeds' in data:
+            kwargs['json'].setdefault('allowed_mentions', {'parse': []})
+    return await client.http.request(route, **kwargs)
 
 tracker = meeting_tracker.MeetingTracker(BOT_ID, api_call)
-_active_gateway_ws = None
 _guild_voice_states = {}  # uid -> {'channel_id': cid, 'username': str, 'display_name': str}
 
-async def send_voice_state_update(guild_id: str, channel_id: str = None, self_mute: bool = False, self_deaf: bool = False):
-    global _active_gateway_ws
-    if _active_gateway_ws:
-        payload = {
-            'op': 4,
-            'd': {
-                'guild_id': guild_id,
-                'channel_id': channel_id,
-                'self_mute': self_mute,
-                'self_deaf': self_deaf
-            }
-        }
-        await _active_gateway_ws.send(json.dumps(payload))
-        print(f"[VoiceGateway] Opcode 4 sent: channel_id={channel_id}")
+
 
 async def meeting_monitor_loop():
+    await client.wait_until_ready()
     while True:
         await asyncio.sleep(10)
         try:
             if tracker.check_auto_end(grace_period_secs=60):
-                print("[MeetingTracker] Auto-ending meeting after 60s of empty VC...")
-                await send_voice_state_update(GUILD_ID, None)
-                ok, embed, summary = tracker.end_meeting()
-                if ok and embed:
-                    api_call(
-                        f'/channels/{tracker.reports_channel_id}/messages',
-                        method='POST',
-                        data={
-                            'content': "⚠️ *Founders meeting ended automatically after 60 seconds of empty VC.*",
-                            'embeds': [embed]
-                        }
-                    )
-        except Exception as e:
-            print(f"[MeetingMonitor] Error: {e}")
+                await finish_meeting(automatic=True)
+        except Exception as exc:
+            logging.error('Meeting auto-end failed: %s', type(exc).__name__)
 
-def send_channel_file(channel_id, file_bytes, filename="image.jpg", payload=None):
-    boundary = "----DiscordBotBoundary" + uuid.uuid4().hex
-    body = bytearray()
-    if payload:
-        body.extend(f"--{boundary}\r\n".encode("utf-8"))
-        body.extend(b'Content-Disposition: form-data; name="payload_json"\r\n')
-        body.extend(b'Content-Type: application/json\r\n\r\n')
-        body.extend(json.dumps(payload).encode("utf-8"))
-        body.extend(b"\r\n")
+async def send_channel_file(channel_id, file_bytes, filename="image.jpg", payload=None):
+    channel = client.get_channel(int(channel_id)) or await client.fetch_channel(int(channel_id))
+    options = message_options(payload or {})
+    with closing(discord.File(io.BytesIO(file_bytes), filename=filename)) as upload:
+        message = await channel.send(file=upload, **options)
+    return {'id': str(message.id)}
 
-    body.extend(f"--{boundary}\r\n".encode("utf-8"))
-    body.extend(f'Content-Disposition: form-data; name="files[0]"; filename="{filename}"\r\n'.encode("utf-8"))
-    body.extend(b"Content-Type: image/jpeg\r\n\r\n")
-    body.extend(file_bytes)
-    body.extend(b"\r\n")
-    body.extend(f"--{boundary}--\r\n".encode("utf-8"))
-
-    url = f"{BASE_URL}/channels/{channel_id}/messages"
-    req = urllib.request.Request(
-        url,
-        data=body,
-        headers={
-            "Authorization": f"Bot {TOKEN}",
-            "User-Agent": "DiscordBot (RippleBot, 1.0)",
-            "Content-Type": f"multipart/form-data; boundary={boundary}"
-        },
-        method="POST"
-    )
-    try:
-        with urllib.request.urlopen(req) as resp:
-            return json.loads(resp.read().decode("utf-8"))
-    except Exception as e:
-        print(f"Error sending channel file: {e}")
-        return None
-
-def interaction_edit_original_file(i_token, file_bytes, filename="image.jpg", payload=None):
-    boundary = "----DiscordBotBoundary" + uuid.uuid4().hex
-    body = bytearray()
-    if payload:
-        body.extend(f"--{boundary}\r\n".encode("utf-8"))
-        body.extend(b'Content-Disposition: form-data; name="payload_json"\r\n')
-        body.extend(b'Content-Type: application/json\r\n\r\n')
-        body.extend(json.dumps(payload).encode("utf-8"))
-        body.extend(b"\r\n")
-
-    body.extend(f"--{boundary}\r\n".encode("utf-8"))
-    body.extend(f'Content-Disposition: form-data; name="files[0]"; filename="{filename}"\r\n'.encode("utf-8"))
-    body.extend(b"Content-Type: image/jpeg\r\n\r\n")
-    body.extend(file_bytes)
-    body.extend(b"\r\n")
-    body.extend(f"--{boundary}--\r\n".encode("utf-8"))
-
-    url = f"{BASE_URL}/webhooks/{BOT_ID}/{i_token}/messages/@original"
-    req = urllib.request.Request(
-        url,
-        data=body,
-        headers={
-            "User-Agent": "DiscordBot (RippleBot, 1.0)",
-            "Content-Type": f"multipart/form-data; boundary={boundary}"
-        },
-        method="PATCH"
-    )
-    try:
-        with urllib.request.urlopen(req) as resp:
-            return True
-    except Exception as e:
-        print(f"[Interaction] Edit original file error: {e}")
-        return False
+async def interaction_edit_original_file(i_token, file_bytes, filename="image.jpg", payload=None):
+    interaction = _interactions[i_token]
+    with closing(discord.File(io.BytesIO(file_bytes), filename=filename)) as upload:
+        await interaction.edit_original_response(attachments=[upload], **message_options(payload or {}))
+    return True
 
 def resolve_lang(q):
     if not q:
@@ -287,103 +200,48 @@ def do_translate(text, target_code='en', source_code='auto'):
     
     return text
 
-def modify_role(user_id, role_id, action='PUT'):
+async def modify_role(user_id, role_id, action='PUT'):
     url = f'/guilds/{GUILD_ID}/members/{user_id}/roles/{role_id}'
     try:
-        api_call(url, method=action)
+        await api_call(url, method=action)
         print(f"[{action}] Role {role_id} for user {user_id}")
     except Exception as e:
         print(f"Error {action} role {role_id} for user {user_id}: {e}")
 
-def get_channel_webhook(channel_id):
+async def get_channel_webhook(channel_id):
     if channel_id in _webhook_cache:
         return _webhook_cache[channel_id]
 
     try:
-        webhooks = api_call(f'/channels/{channel_id}/webhooks')
+        webhooks = await api_call(f'/channels/{channel_id}/webhooks')
         for w in webhooks:
             if w.get('name') == 'RippleProxy' and w.get('token'):
                 _webhook_cache[channel_id] = (w['id'], w['token'])
                 return _webhook_cache[channel_id]
 
-        new_wh = api_call(f'/channels/{channel_id}/webhooks', method='POST', data={'name': 'RippleProxy'})
+        new_wh = await api_call(f'/channels/{channel_id}/webhooks', method='POST', data={'name': 'RippleProxy'})
         _webhook_cache[channel_id] = (new_wh['id'], new_wh['token'])
         return _webhook_cache[channel_id]
     except Exception as e:
         print(f"Error retrieving/creating webhook for channel {channel_id}: {e}")
         return None
 
-async def send_heartbeat(ws, interval):
-    while True:
-        await asyncio.sleep(interval)
-        try:
-            await ws.send(json.dumps({'op': 1, 'd': None}))
-        except Exception:
-            break
 
-def interaction_callback(i_id, i_token, payload, max_retries=3):
-    url = f'{BASE_URL}/interactions/{i_id}/{i_token}/callback'
-    body = json.dumps(payload).encode('utf-8')
-    headers = {
-        'Content-Type': 'application/json',
-        'User-Agent': 'DiscordBot (RippleBot, 1.0)',
-        'Authorization': f'Bot {TOKEN}'
-    }
-    for attempt in range(max_retries):
-        try:
-            req = urllib.request.Request(url, data=body, headers=headers, method='POST')
-            with urllib.request.urlopen(req, timeout=6) as resp:
-                return True
-        except urllib.error.HTTPError as e:
-            if e.code == 429:
-                err_raw = ""
-                retry_after = 1.0
-                try:
-                    err_raw = e.read().decode('utf-8')
-                    err_body = json.loads(err_raw)
-                    retry_after = float(err_body.get('retry_after', 1.0))
-                except Exception:
-                    pass
-                print(f"[Interaction] 429 on callback. Response: {err_raw}. Retrying in {retry_after}s (attempt {attempt+1}/{max_retries})...")
-                time.sleep(retry_after)
-                continue
-            print(f"[Interaction] Callback HTTP error {e.code}: {e}")
-            return False
-        except Exception as e:
-            print(f"[Interaction] Callback error: {e}")
-            return False
-    return False
 
-def interaction_edit_original(i_token, payload, max_retries=3):
-    url = f'{BASE_URL}/webhooks/{BOT_ID}/{i_token}/messages/@original'
-    body = json.dumps(payload).encode('utf-8')
-    headers = {
-        'Content-Type': 'application/json',
-        'User-Agent': 'DiscordBot (RippleBot, 1.0)',
-        'Authorization': f'Bot {TOKEN}'
-    }
-    for attempt in range(max_retries):
-        try:
-            req = urllib.request.Request(url, data=body, headers=headers, method='PATCH')
-            with urllib.request.urlopen(req, timeout=10) as resp:
-                return True
-        except urllib.error.HTTPError as e:
-            if e.code == 429:
-                retry_after = 0.5
-                try:
-                    err_body = json.loads(e.read().decode('utf-8'))
-                    retry_after = float(err_body.get('retry_after', 0.5))
-                except Exception:
-                    pass
-                print(f"[Interaction] 429 on edit original. Retrying in {retry_after}s (attempt {attempt+1}/{max_retries})...")
-                time.sleep(retry_after)
-                continue
-            print(f"[Interaction] Edit original HTTP error {e.code}: {e}")
-            return False
-        except Exception as e:
-            print(f"[Interaction] Edit original error: {e}")
-            return False
-    return False
+async def interaction_callback(i_id, i_token, payload, max_retries=3):
+    interaction = _interactions[i_token]
+    if interaction.response.is_done():
+        return True
+    data = payload.get('data', {})
+    if payload['type'] == 5:
+        await interaction.response.defer(thinking=True, ephemeral=bool(data.get('flags', 0) & 64))
+    else:
+        await interaction.response.send_message(ephemeral=bool(data.get('flags', 0) & 64), **message_options(data))
+    return True
+
+async def interaction_edit_original(i_token, payload, max_retries=3):
+    await _interactions[i_token].edit_original_response(**message_options(payload))
+    return True
 
 async def handle_interaction(d):
     try:
@@ -405,31 +263,34 @@ async def handle_interaction(d):
 
         # 1. /purge command
         if cname == 'purge':
-            ok = interaction_callback(i_id, i_token, {'type': 5, 'data': {'flags': 64}})
+            if not _interactions[i_token].permissions.manage_messages:
+                await interaction_callback(i_id, i_token, {'type': 4, 'data': {'content': 'Manage Messages permission required.', 'flags': 64}})
+                return
+            ok = await interaction_callback(i_id, i_token, {'type': 5, 'data': {'flags': 64}})
             if not ok:
                 return
 
             p_ok, p_msg = rate_limiter.check_purge_cooldown(channel_id)
             if not p_ok:
-                interaction_edit_original(i_token, {'content': p_msg})
+                await interaction_edit_original(i_token, {'content': p_msg})
                 return
 
             options = {opt['name']: opt['value'] for opt in data.get('options', [])}
             amount = min(max(int(options.get('amount', 5)), 1), 100)
 
             try:
-                msgs = api_call(f'/channels/{channel_id}/messages?limit={amount}')
+                msgs = await api_call(f'/channels/{channel_id}/messages?limit={amount}')
                 if msgs:
                     msg_ids = [m['id'] for m in msgs]
                     if len(msg_ids) == 1:
-                        api_call(f'/channels/{channel_id}/messages/{msg_ids[0]}', method='DELETE')
+                        await api_call(f'/channels/{channel_id}/messages/{msg_ids[0]}', method='DELETE')
                     else:
-                        api_call(f'/channels/{channel_id}/messages/bulk-delete', method='POST', data={'messages': msg_ids})
-                    interaction_edit_original(i_token, {'content': f"🧹 Purged **{len(msg_ids)}** messages from this channel!"})
+                        await api_call(f'/channels/{channel_id}/messages/bulk-delete', method='POST', data={'messages': msg_ids})
+                    await interaction_edit_original(i_token, {'content': f"🧹 Purged **{len(msg_ids)}** messages from this channel!"})
                 else:
-                    interaction_edit_original(i_token, {'content': "No messages found to purge."})
+                    await interaction_edit_original(i_token, {'content': "No messages found to purge."})
             except Exception as e:
-                interaction_edit_original(i_token, {'content': f"⚠️ Error purging messages: {e}"})
+                await interaction_edit_original(i_token, {'content': f"⚠️ Error purging messages: {e}"})
             return
 
         # 2. /languages
@@ -441,7 +302,7 @@ async def handle_interaction(d):
                 "`ar` Arabic • `hi` Hindi • `nl` Dutch • `tr` Turkish • `vi` Vietnamese\n\n"
                 "*Use with `/translate`, `/speak`, or reply to any message with `to spanish` or `!tr`.*"
             )
-            interaction_callback(i_id, i_token, {
+            await interaction_callback(i_id, i_token, {
                 'type': 4,
                 'data': {
                     'embeds': [{
@@ -457,10 +318,10 @@ async def handle_interaction(d):
         if cname in ('imagine', 'image'):
             allowed, limit_msg = rate_limiter.check_rate_limit(user_id)
             if not allowed:
-                interaction_callback(i_id, i_token, {'type': 4, 'data': {'content': limit_msg, 'flags': 64}})
+                await interaction_callback(i_id, i_token, {'type': 4, 'data': {'content': limit_msg, 'flags': 64}})
                 return
 
-            ok = interaction_callback(i_id, i_token, {'type': 5})
+            ok = await interaction_callback(i_id, i_token, {'type': 5})
             if not ok:
                 return
 
@@ -479,21 +340,21 @@ async def handle_interaction(d):
                         'footer': {'text': f'Requested by {user_name} • {model.upper()} Model'}
                     }]
                 }
-                interaction_edit_original_file(i_token, img_bytes, filename="generated.jpg", payload=payload)
+                await interaction_edit_original_file(i_token, img_bytes, filename="generated.jpg", payload=payload)
             except Exception as e:
-                interaction_edit_original(i_token, {'content': f"⚠️ Failed to generate image: {e}"})
+                await interaction_edit_original(i_token, {'content': f"⚠️ Failed to generate image: {e}"})
             return
 
         # Rate limit check for text/AI commands
         if cname in ('translate', 'speak', 'Translate to English', 'ask'):
             allowed, limit_msg = rate_limiter.check_rate_limit(user_id)
             if not allowed:
-                interaction_callback(i_id, i_token, {'type': 4, 'data': {'content': limit_msg, 'flags': 64}})
+                await interaction_callback(i_id, i_token, {'type': 4, 'data': {'content': limit_msg, 'flags': 64}})
                 return
 
         # 4. /translate
         if cname == 'translate':
-            ok = interaction_callback(i_id, i_token, {'type': 5})
+            ok = await interaction_callback(i_id, i_token, {'type': 5})
             if not ok:
                 return
 
@@ -503,7 +364,7 @@ async def handle_interaction(d):
             source_input = options.get('from', 'auto')
 
             if not text_to_translate:
-                interaction_edit_original(i_token, {'content': "Provide text to translate: `/translate text: <text> to: <lang>`"})
+                await interaction_edit_original(i_token, {'content': "Provide text to translate: `/translate text: <text> to: <lang>`"})
                 return
 
             tgt_code, tgt_name = resolve_lang(target_input)
@@ -521,12 +382,12 @@ async def handle_interaction(d):
                 ],
                 'footer': {'text': f'Requested by {user_name}'}
             }
-            interaction_edit_original(i_token, {'embeds': [embed]})
+            await interaction_edit_original(i_token, {'embeds': [embed]})
             return
 
         # 5. /speak
         if cname == 'speak':
-            ok = interaction_callback(i_id, i_token, {'type': 5, 'data': {'flags': 64}})
+            ok = await interaction_callback(i_id, i_token, {'type': 5, 'data': {'flags': 64}})
             if not ok:
                 return
 
@@ -538,37 +399,23 @@ async def handle_interaction(d):
             loop = asyncio.get_event_loop()
             translated = await loop.run_in_executor(None, do_translate, raw_message, tgt_code, 'auto')
 
-            wh_info = get_channel_webhook(channel_id)
+            wh_info = await get_channel_webhook(channel_id)
             if wh_info:
                 wh_id, wh_token = wh_info
-                wh_url = f'{BASE_URL}/webhooks/{wh_id}/{wh_token}'
-                wh_payload = {
-                    'content': translated,
-                    'username': f"{user_name} ({tgt_name})",
-                    'avatar_url': user_avatar
-                }
-                req = urllib.request.Request(
-                    wh_url,
-                    data=json.dumps(wh_payload).encode('utf-8'),
-                    headers={'Content-Type': 'application/json', 'User-Agent': 'DiscordBot (RippleBot, 1.0)'},
-                    method='POST'
-                )
-                try:
-                    urllib.request.urlopen(req)
-                except Exception as e:
-                    print(f"Webhook error: {e}")
+                webhook = discord.Webhook.partial(int(wh_id), wh_token, client=client)
+                await webhook.send(translated, username=f"{user_name} ({tgt_name})", avatar_url=user_avatar, allowed_mentions=discord.AllowedMentions.none())
 
-                interaction_edit_original(i_token, {'content': f"✅ Sent in **{tgt_name}**!"})
+                await interaction_edit_original(i_token, {'content': f"✅ Sent in **{tgt_name}**!"})
             else:
-                api_call(f'/channels/{channel_id}/messages', method='POST', data={
+                await api_call(f'/channels/{channel_id}/messages', method='POST', data={
                     'content': f"**{user_name}** ({tgt_name}): {translated}"
                 })
-                interaction_edit_original(i_token, {'content': f"✅ Sent!"})
+                await interaction_edit_original(i_token, {'content': f"✅ Sent!"})
             return
 
         # 6. Translate to English (Context Menu)
         if cname == 'Translate to English':
-            ok = interaction_callback(i_id, i_token, {'type': 5})
+            ok = await interaction_callback(i_id, i_token, {'type': 5})
             if not ok:
                 return
 
@@ -580,7 +427,7 @@ async def handle_interaction(d):
             author_name = target_msg.get('author', {}).get('username', 'Original Author')
 
             if not text_to_translate:
-                interaction_edit_original(i_token, {'content': "No text found to translate."})
+                await interaction_edit_original(i_token, {'content': "No text found to translate."})
                 return
 
             loop = asyncio.get_event_loop()
@@ -595,12 +442,12 @@ async def handle_interaction(d):
                 ],
                 'footer': {'text': f'Requested by {user_name}'}
             }
-            interaction_edit_original(i_token, {'embeds': [embed]})
+            await interaction_edit_original(i_token, {'embeds': [embed]})
             return
 
         # 7. /ask
         if cname == 'ask':
-            ok = interaction_callback(i_id, i_token, {'type': 5})
+            ok = await interaction_callback(i_id, i_token, {'type': 5})
             if not ok:
                 return
 
@@ -612,54 +459,32 @@ async def handle_interaction(d):
 
             chunks = split_discord_chunks(answer, max_len=1900)
             if chunks:
-                interaction_edit_original(i_token, {'content': chunks[0]})
+                await interaction_edit_original(i_token, {'content': chunks[0]})
                 for ch in chunks[1:]:
-                    api_call(f'/channels/{channel_id}/messages', method='POST', data={'content': ch})
+                    await api_call(f'/channels/{channel_id}/messages', method='POST', data={'content': ch})
             return
 
         # 8. /meeting
         if cname == 'meeting':
+            await interaction_callback(i_id, i_token, {'type': 5, 'data': {'flags': 64}})
+            interaction = _interactions[i_token]
+            if not await can_use_meeting(interaction.user, channel_id):
+                await interaction_edit_original(i_token, {'content': 'Use meeting commands inside the Founders channels.'})
+                return
             options = data.get('options', [])
             subcmd = options[0].get('name') if options else 'status'
-
-            # Defer interaction immediately to prevent 3-second Discord timeout
-            interaction_callback(i_id, i_token, {'type': 5})
-
-            if subcmd == 'start':
-                current_in_vc = [
-                    {'user_id': uid, 'username': info['username'], 'display_name': info['display_name']}
-                    for uid, info in _guild_voice_states.items()
-                    if info.get('channel_id') == meeting_tracker.FOUNDERS_VC_ID and uid != BOT_ID
-                ]
-                ok, msg = tracker.start_meeting(user_name, current_in_vc)
-                if ok:
-                    await send_voice_state_update(GUILD_ID, meeting_tracker.FOUNDERS_VC_ID, self_mute=False, self_deaf=False)
-                interaction_edit_original(i_token, {'content': msg})
-                return
-
-            elif subcmd == 'end':
-                await send_voice_state_update(GUILD_ID, None)
-                loop = asyncio.get_event_loop()
-                ok, embeds, summary = await loop.run_in_executor(None, tracker.end_meeting)
-                if ok and embeds:
-                    api_call(f'/channels/{tracker.reports_channel_id}/messages', method='POST', data={'embeds': embeds})
-                    interaction_edit_original(i_token, {'content': summary})
-                else:
-                    interaction_edit_original(i_token, {'content': summary})
-                return
-
-            elif subcmd == 'status':
-                embed = tracker.get_status_embed()
-                interaction_edit_original(i_token, {'embeds': [embed]})
-                return
-
-            elif subcmd == 'stats':
-                embed = tracker.get_stats_embed()
-                interaction_edit_original(i_token, {'embeds': [embed]})
-                return
+            result = await meeting_command(subcmd, user_name)
+            await interaction_edit_original(i_token, result)
+            return
 
     except Exception as e:
-        print(f"[Error] in handle_interaction: {e}")
+        logging.error('Interaction %s failed: %s', d.get('data', {}).get('name'), type(e).__name__)
+        interaction = _interactions.get(d.get('token'))
+        if interaction and interaction.response.is_done():
+            try:
+                await interaction.edit_original_response(content='Command failed. Check bot permissions and service logs, then retry.')
+            except discord.HTTPException:
+                pass
 
 def split_discord_chunks(text: str, max_len: int = 1900) -> list[str]:
     if not text:
@@ -693,13 +518,13 @@ def split_discord_chunks(text: str, max_len: int = 1900) -> list[str]:
         chunks.append(current.strip())
     return chunks
 
-def send_discord_reply(channel_id: str, content: str, reply_to_id: str = None):
+async def send_discord_reply(channel_id: str, content: str, reply_to_id: str = None):
     chunks = split_discord_chunks(content, max_len=1900)
     for i, chunk in enumerate(chunks):
         data = {'content': chunk}
         if i == 0 and reply_to_id:
             data['message_reference'] = {'message_id': reply_to_id}
-        api_call(f'/channels/{channel_id}/messages', method='POST', data=data)
+        await api_call(f'/channels/{channel_id}/messages', method='POST', data=data)
 
 def extract_media_from_message(msg: dict) -> str:
     if not msg or not isinstance(msg, dict):
@@ -738,81 +563,27 @@ async def handle_message(d):
         author_id = author.get('id', '')
         author_name = author.get('global_name') or author.get('username') or 'Founder'
 
-        # 0. Meeting text commands: !meeting start/end/status/stats, !note, !startmeeting, !endmeeting
-        m_meeting = re.match(r'^(?:!meeting\s+(start|join|end|stop|status|stats|leaderboard)|!startmeeting|!endmeeting|!note\s+(.*))', content, re.IGNORECASE)
-        if m_meeting:
-            raw_match = m_meeting.group(0).lower()
-            if raw_match.startswith('!note'):
-                note_text = m_meeting.group(2) or ''
-                if note_text.strip():
+        # Meeting commands share the same serialized lifecycle as slash commands.
+        match = re.fullmatch(r'(?:!meeting|<@!?1546333781764345936>\s*meeting)(?:\s+(start|join|end|stop|status|stats|leaderboard))?|!(startmeeting|endmeeting)|!note\s+(.+)', content, re.IGNORECASE | re.DOTALL)
+        if match:
+            channel = client.get_channel(int(channel_id))
+            guild = getattr(channel, 'guild', None)
+            member = guild.get_member(int(author_id)) if guild else None
+            if not await can_use_meeting(member, channel_id):
+                await api_call(f'/channels/{channel_id}/messages', method='POST', data={'content': 'Use meeting commands inside the Founders channels.'})
+                return
+            if match.group(3):
+                async with _meeting_lock:
                     if tracker.is_active:
-                        tracker.add_transcript(author_name, note_text.strip())
-                        api_call(f'/channels/{channel_id}/messages', method='POST', data={
-                            'content': f"📝 *Note added to meeting brief by {author_name}*",
-                            'message_reference': {'message_id': msg_id}
-                        })
+                        tracker.add_transcript(author_name, match.group(3))
+                        result = {'content': 'Note added to the meeting.'}
                     else:
-                        api_call(f'/channels/{channel_id}/messages', method='POST', data={
-                            'content': "⚠️ No meeting is currently active. Start one with `!meeting start` or `/meeting start`.",
-                            'message_reference': {'message_id': msg_id}
-                        })
-                return
-
-            cmd = (m_meeting.group(1) or '').lower()
-            if not cmd:
-                if '!startmeeting' in raw_match:
-                    cmd = 'start'
-                elif '!endmeeting' in raw_match:
-                    cmd = 'end'
-                else:
-                    cmd = 'status'
-
-            if cmd in ('start', 'join'):
-                current_in_vc = [
-                    {'user_id': uid, 'username': info['username'], 'display_name': info['display_name']}
-                    for uid, info in _guild_voice_states.items()
-                    if info.get('channel_id') == meeting_tracker.FOUNDERS_VC_ID and uid != BOT_ID
-                ]
-                ok, msg = tracker.start_meeting(author_name, current_in_vc)
-                if ok:
-                    await send_voice_state_update(GUILD_ID, meeting_tracker.FOUNDERS_VC_ID)
-                api_call(f'/channels/{channel_id}/messages', method='POST', data={
-                    'content': msg,
-                    'message_reference': {'message_id': msg_id}
-                })
-                return
-
-            elif cmd in ('end', 'stop'):
-                await send_voice_state_update(GUILD_ID, None)
-                ok, embeds, summary = tracker.end_meeting()
-                if ok and embeds:
-                    api_call(f'/channels/{tracker.reports_channel_id}/messages', method='POST', data={'embeds': embeds})
-                    api_call(f'/channels/{channel_id}/messages', method='POST', data={
-                        'content': summary,
-                        'message_reference': {'message_id': msg_id}
-                    })
-                else:
-                    api_call(f'/channels/{channel_id}/messages', method='POST', data={
-                        'content': summary,
-                        'message_reference': {'message_id': msg_id}
-                    })
-                return
-
-            elif cmd == 'status':
-                embed = tracker.get_status_embed()
-                api_call(f'/channels/{channel_id}/messages', method='POST', data={
-                    'embeds': [embed],
-                    'message_reference': {'message_id': msg_id}
-                })
-                return
-
-            elif cmd in ('stats', 'leaderboard'):
-                embed = tracker.get_stats_embed()
-                api_call(f'/channels/{channel_id}/messages', method='POST', data={
-                    'embeds': [embed],
-                    'message_reference': {'message_id': msg_id}
-                })
-                return
+                        result = {'content': 'No active meeting. Use /meeting start first.'}
+            else:
+                command = match.group(1) or {'startmeeting': 'start', 'endmeeting': 'end'}.get((match.group(2) or '').lower(), 'status')
+                result = await meeting_command(command.lower(), author_name)
+            await api_call(f'/channels/{channel_id}/messages', method='POST', data={**result, 'message_reference': {'message_id': msg_id}})
+            return
 
         # 0.1 In-meeting live discussion & voice notes capture
         if tracker.is_active and channel_id in (meeting_tracker.FOUNDERS_VC_ID, '1545542223381274634'):
@@ -822,13 +593,12 @@ async def handle_message(d):
                 ctype = att.get('content_type') or ''
                 if any(ext in fname for ext in ('.ogg', '.wav', '.mp3', '.m4a')) or 'audio/' in ctype:
                     try:
-                        req_a = urllib.request.Request(att['url'], headers={'User-Agent': 'RippleBot/1.0'})
-                        with urllib.request.urlopen(req_a, timeout=15) as ra:
-                            a_bytes = ra.read()
-                        transcribed = groq_engine.groq_transcribe_audio(a_bytes, fname)
-                        if transcribed:
+                        meeting_id = tracker.start_time
+                        a_bytes = await asyncio.to_thread(download_media, att['url'])
+                        transcribed = await asyncio.to_thread(groq_engine.groq_transcribe_audio, a_bytes, fname)
+                        if transcribed and tracker.is_active and tracker.start_time == meeting_id:
                             tracker.add_transcript(author_name, f"[Voice Note]: {transcribed}")
-                            api_call(f'/channels/{channel_id}/messages', method='POST', data={
+                            await api_call(f'/channels/{channel_id}/messages', method='POST', data={
                                 'content': f"🎙️ **Transcribed Voice Note ({author_name}):**\n\"{transcribed}\"",
                                 'message_reference': {'message_id': msg_id}
                             })
@@ -839,44 +609,17 @@ async def handle_message(d):
             if content and not content.startswith(('!', '/', '?')):
                 tracker.add_transcript(author_name, content)
 
-        # 0. Meeting text commands: !meeting start | end | status | stats
-        m_mtg = re.match(r'^(?:!meeting|<@!?1546333781764345936>\s*meeting)\s*(start|end|status|stats)?', content, re.IGNORECASE)
-        if m_mtg:
-            sub = (m_mtg.group(1) or 'status').lower()
-            if sub == 'start':
-                current_in_vc = [
-                    {'user_id': uid, 'username': info['username'], 'display_name': info['display_name']}
-                    for uid, info in _guild_voice_states.items()
-                    if info.get('channel_id') == meeting_tracker.FOUNDERS_VC_ID and uid != BOT_ID
-                ]
-                ok, msg = tracker.start_meeting(author_name, current_in_vc)
-                if ok:
-                    await send_voice_state_update(GUILD_ID, meeting_tracker.FOUNDERS_VC_ID, self_mute=False, self_deaf=False)
-                api_call(f'/channels/{channel_id}/messages', method='POST', data={'content': msg, 'message_reference': {'message_id': msg_id}})
-                return
-            elif sub == 'end':
-                await send_voice_state_update(GUILD_ID, None)
-                loop = asyncio.get_event_loop()
-                ok, embeds, summary = await loop.run_in_executor(None, tracker.end_meeting)
-                if ok and embeds:
-                    api_call(f'/channels/{tracker.reports_channel_id}/messages', method='POST', data={'embeds': embeds})
-                api_call(f'/channels/{channel_id}/messages', method='POST', data={'content': summary, 'message_reference': {'message_id': msg_id}})
-                return
-            elif sub == 'status':
-                embed = tracker.get_status_embed()
-                api_call(f'/channels/{channel_id}/messages', method='POST', data={'embeds': [embed], 'message_reference': {'message_id': msg_id}})
-                return
-            elif sub == 'stats':
-                embed = tracker.get_stats_embed()
-                api_call(f'/channels/{channel_id}/messages', method='POST', data={'embeds': [embed], 'message_reference': {'message_id': msg_id}})
-                return
-
         # 1. Purge text command: !purge <amount> or @RippleBot purge <amount>
         m_purge = re.match(r'^(?:!purge|<@!?1546333781764345936>\s*purge)\s*(\d+)?', content, re.IGNORECASE)
         if m_purge:
+            channel = client.get_channel(int(channel_id))
+            member = channel.guild.get_member(int(author_id)) if getattr(channel, 'guild', None) else None
+            if member is None or not channel.permissions_for(member).manage_messages:
+                await api_call(f'/channels/{channel_id}/messages', method='POST', data={'content': 'Manage Messages permission required.'})
+                return
             p_ok, p_msg = rate_limiter.check_purge_cooldown(channel_id)
             if not p_ok:
-                api_call(f'/channels/{channel_id}/messages', method='POST', data={
+                await api_call(f'/channels/{channel_id}/messages', method='POST', data={
                     'content': p_msg,
                     'message_reference': {'message_id': msg_id}
                 })
@@ -886,26 +629,26 @@ async def handle_message(d):
             amount = min(max(int(amount_str) if amount_str else 5, 1), 100)
 
             try:
-                api_call(f'/channels/{channel_id}/messages/{msg_id}', method='DELETE')
+                await api_call(f'/channels/{channel_id}/messages/{msg_id}', method='DELETE')
             except Exception:
                 pass
 
-            msgs = api_call(f'/channels/{channel_id}/messages?limit={amount}')
+            msgs = await api_call(f'/channels/{channel_id}/messages?limit={amount}')
             if msgs:
                 msg_ids = [m['id'] for m in msgs]
                 if len(msg_ids) == 1:
-                    api_call(f'/channels/{channel_id}/messages/{msg_ids[0]}', method='DELETE')
+                    await api_call(f'/channels/{channel_id}/messages/{msg_ids[0]}', method='DELETE')
                 else:
-                    api_call(f'/channels/{channel_id}/messages/bulk-delete', method='POST', data={'messages': msg_ids})
+                    await api_call(f'/channels/{channel_id}/messages/bulk-delete', method='POST', data={'messages': msg_ids})
 
-                sent = api_call(f'/channels/{channel_id}/messages', method='POST', data={
+                sent = await api_call(f'/channels/{channel_id}/messages', method='POST', data={
                     'content': f"🧹 Purged **{len(msg_ids)}** messages!"
                 })
                 if sent and sent.get('id'):
                     async def auto_delete(c_id, m_id):
                         await asyncio.sleep(3)
                         try:
-                            api_call(f'/channels/{c_id}/messages/{m_id}', method='DELETE')
+                            await api_call(f'/channels/{c_id}/messages/{m_id}', method='DELETE')
                         except Exception:
                             pass
                     asyncio.create_task(auto_delete(channel_id, sent['id']))
@@ -916,7 +659,7 @@ async def handle_message(d):
         if m_img:
             allowed, limit_msg = rate_limiter.check_rate_limit(author_id)
             if not allowed:
-                api_call(f'/channels/{channel_id}/messages', method='POST', data={
+                await api_call(f'/channels/{channel_id}/messages', method='POST', data={
                     'content': limit_msg,
                     'message_reference': {'message_id': msg_id}
                 })
@@ -924,7 +667,7 @@ async def handle_message(d):
 
             prompt = m_img.group(1).strip()
             try:
-                api_call(f'/channels/{channel_id}/typing', method='POST')
+                await api_call(f'/channels/{channel_id}/typing', method='POST')
             except Exception:
                 pass
 
@@ -941,9 +684,9 @@ async def handle_message(d):
                     }],
                     'message_reference': {'message_id': msg_id}
                 }
-                send_channel_file(channel_id, img_bytes, filename="generated.jpg", payload=payload)
+                await send_channel_file(channel_id, img_bytes, filename="generated.jpg", payload=payload)
             except Exception as e:
-                api_call(f'/channels/{channel_id}/messages', method='POST', data={
+                await api_call(f'/channels/{channel_id}/messages', method='POST', data={
                     'content': f"⚠️ Failed to generate image: {e}",
                     'message_reference': {'message_id': msg_id}
                 })
@@ -982,7 +725,7 @@ async def handle_message(d):
             if is_reply_translation:
                 allowed, limit_msg = rate_limiter.check_rate_limit(author_id)
                 if not allowed:
-                    api_call(f'/channels/{channel_id}/messages', method='POST', data={
+                    await api_call(f'/channels/{channel_id}/messages', method='POST', data={
                         'content': limit_msg,
                         'message_reference': {'message_id': msg_id}
                     })
@@ -996,12 +739,12 @@ async def handle_message(d):
                 else:
                     ref_id = ref.get('message_id')
                     if ref_id:
-                        m = api_call(f'/channels/{channel_id}/messages/{ref_id}')
+                        m = await api_call(f'/channels/{channel_id}/messages/{ref_id}')
                         target_text = m.get('content', '')
                         ref_author = m.get('author', {}).get('username', 'User')
 
                 if not target_text:
-                    api_call(f'/channels/{channel_id}/messages', method='POST', data={
+                    await api_call(f'/channels/{channel_id}/messages', method='POST', data={
                         'content': "💡 **Tip:** Right-click the message ➔ **Apps** ➔ **Translate to English**",
                         'message_reference': {'message_id': msg_id}
                     })
@@ -1021,7 +764,7 @@ async def handle_message(d):
                     'footer': {'text': f'Replied by {author.get("username", "User")}'}
                 }
 
-                api_call(f'/channels/{channel_id}/messages', method='POST', data={
+                await api_call(f'/channels/{channel_id}/messages', method='POST', data={
                     'embeds': [embed],
                     'message_reference': {'message_id': msg_id}
                 })
@@ -1031,7 +774,7 @@ async def handle_message(d):
         if is_tr_cmd or (is_bot_mentioned and any(w in content.lower() for w in ['translate ', 'translate\n', 'tr '])):
             allowed, limit_msg = rate_limiter.check_rate_limit(author_id)
             if not allowed:
-                api_call(f'/channels/{channel_id}/messages', method='POST', data={
+                await api_call(f'/channels/{channel_id}/messages', method='POST', data={
                     'content': limit_msg,
                     'message_reference': {'message_id': msg_id}
                 })
@@ -1061,7 +804,7 @@ async def handle_message(d):
                     ],
                     'footer': {'text': f'Requested by {author.get("username", "User")}'}
                 }
-                api_call(f'/channels/{channel_id}/messages', method='POST', data={
+                await api_call(f'/channels/{channel_id}/messages', method='POST', data={
                     'embeds': [embed],
                     'message_reference': {'message_id': msg_id}
                 })
@@ -1071,7 +814,7 @@ async def handle_message(d):
         if is_bot_mentioned or is_reply_to_bot:
             allowed, limit_msg = rate_limiter.check_rate_limit(author_id)
             if not allowed:
-                api_call(f'/channels/{channel_id}/messages', method='POST', data={
+                await api_call(f'/channels/{channel_id}/messages', method='POST', data={
                     'content': limit_msg,
                     'message_reference': {'message_id': msg_id}
                 })
@@ -1086,7 +829,7 @@ async def handle_message(d):
             if not image_url and ref:
                 ref_id = ref.get('message_id')
                 if ref_id:
-                    m = api_call(f'/channels/{channel_id}/messages/{ref_id}')
+                    m = await api_call(f'/channels/{channel_id}/messages/{ref_id}')
                     if isinstance(m, dict):
                         image_url = extract_media_from_message(m)
 
@@ -1094,7 +837,7 @@ async def handle_message(d):
             media_triggers = ['this', 'look', 'see', 'who is', 'what is this', 'what is that', 'pic', 'photo', 'gif', 'image', 'meme', 'view', 'read']
             if not image_url and channel_id and (any(t in prompt_lower for t in media_triggers) or len(cleaned_prompt.split()) <= 3):
                 try:
-                    recent = api_call(f'/channels/{channel_id}/messages?limit=3')
+                    recent = await api_call(f'/channels/{channel_id}/messages?limit=3')
                     if isinstance(recent, list):
                         for past_m in recent:
                             if past_m.get('id') != msg_id and past_m.get('author', {}).get('id') != BOT_ID:
@@ -1106,7 +849,7 @@ async def handle_message(d):
                     print(f"Channel history media scan error: {e}")
 
             try:
-                api_call(f'/channels/{channel_id}/typing', method='POST')
+                await api_call(f'/channels/{channel_id}/typing', method='POST')
             except Exception:
                 pass
 
@@ -1116,23 +859,18 @@ async def handle_message(d):
             # A. Vision flow
             if image_url:
                 try:
-                    req = urllib.request.Request(image_url, headers={
-                        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)',
-                        'Connection': 'close'
-                    })
-                    with urllib.request.urlopen(req, timeout=12) as r:
-                        img_bytes = r.read()
-                    data_url = groq_engine.prepare_image_base64(img_bytes)
+                    img_bytes = await asyncio.to_thread(download_media, image_url)
+                    data_url = await asyncio.to_thread(groq_engine.prepare_image_base64, img_bytes)
                     answer = await loop.run_in_executor(None, groq_engine.groq_vision_chat, cleaned_prompt, data_url, user_display)
                 except Exception as e:
                     answer = f"⚠️ Couldn't process image/GIF: {e}"
 
-                send_discord_reply(channel_id, answer, reply_to_id=msg_id)
+                await send_discord_reply(channel_id, answer, reply_to_id=msg_id)
                 return
 
             # B. Empty mention
             if not cleaned_prompt:
-                api_call(f'/channels/{channel_id}/messages', method='POST', data={
+                await api_call(f'/channels/{channel_id}/messages', method='POST', data={
                     'content': "Yo! What's up? Ask me anything, generate images with `!imagine <prompt>`, or clean chat with `/purge`.",
                     'message_reference': {'message_id': msg_id}
                 })
@@ -1140,7 +878,7 @@ async def handle_message(d):
 
             # C. Chat summarization
             if any(k in prompt_lower for k in ['summarize', 'summary', 'what i miss', 'what did i miss', 'recap', 'catch me up']):
-                recent_msgs = api_call(f'/channels/{channel_id}/messages?limit=25')
+                recent_msgs = await api_call(f'/channels/{channel_id}/messages?limit=25')
                 chat_lines = []
                 if recent_msgs:
                     for rm in reversed(recent_msgs):
@@ -1160,156 +898,223 @@ async def handle_message(d):
             if not answer:
                 answer = "Hit a quick hiccup. Try asking again!"
 
-            send_discord_reply(channel_id, answer, reply_to_id=msg_id)
+            await send_discord_reply(channel_id, answer, reply_to_id=msg_id)
             return
 
     except Exception as e:
-        print(f"[Error] in handle_message: {e}")
+        logging.error('Message handler failed: %s', type(e).__name__)
+        try:
+            await api_call(f"/channels/{d['channel_id']}/messages", method='POST', data={'content': 'Command failed. Check bot permissions and service logs, then retry.'})
+        except discord.HTTPException:
+            pass
 
 async def start_health_server():
-    try:
-        from aiohttp import web
-        async def handle_health(request):
-            return web.Response(text="RippleBot is running healthy!", content_type="text/plain")
-        base_port = int(os.environ.get('PORT', 8080))
-        for p in [base_port, 8081, 8082, 0]:
+    from aiohttp import web
+    async def health(request):
+        ready = client.is_ready()
+        return web.json_response({'ready': ready, 'meeting_active': tracker.is_active,
+                                  'voice': recorder.status() if recorder else 'idle'}, status=200 if ready else 503)
+    app = web.Application()
+    app.router.add_get('/', health)
+    app.router.add_get('/health', health)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    await web.TCPSite(runner, '0.0.0.0', int(os.environ.get('PORT', 8080))).start()
+
+def message_options(payload):
+    result = {}
+    for key in ('content',):
+        if key in payload:
+            result[key] = payload[key]
+    if 'embeds' in payload:
+        result['embeds'] = [discord.Embed.from_dict(embed) for embed in payload['embeds']]
+    result['allowed_mentions'] = discord.AllowedMentions.none()
+    return result
+
+
+def download_media(url):
+    parsed = urllib.parse.urlsplit(url)
+    if parsed.scheme != 'https' or parsed.hostname not in {
+        'cdn.discordapp.com', 'media.discordapp.net', 'media.tenor.com',
+        'media.giphy.com', 'i.giphy.com', 'i.imgur.com', 'static.klipy.com'
+    }:
+        raise ValueError('Upload the media to Discord first')
+    # A redirect must not turn an untrusted media URL into a local-network request.
+    class NoRedirect(urllib.request.HTTPRedirectHandler):
+        def redirect_request(self, req, fp, code, msg, headers, newurl):
+            return None
+    opener = urllib.request.build_opener(NoRedirect)
+    with opener.open(urllib.request.Request(url, headers={'User-Agent': 'RippleBot/1.0'}), timeout=15) as response:
+        data = response.read(20 * 1024 * 1024 + 1)
+    if len(data) > 20 * 1024 * 1024:
+        raise ValueError('Media exceeds 20 MB')
+    return data
+
+
+_interactions = {}
+_meeting_lock = asyncio.Lock()
+recorder = None
+
+
+async def can_use_meeting(member, channel_id):
+    channel = client.get_channel(int(channel_id)) if channel_id else None
+    if not isinstance(member, discord.Member) or str(member.guild.id) != GUILD_ID:
+        return False
+    vc = client.get_channel(int(meeting_tracker.FOUNDERS_VC_ID))
+    return bool(vc and channel and channel.category_id == int(meeting_tracker.FOUNDERS_CATEGORY_ID)
+                and vc.permissions_for(member).view_channel and vc.permissions_for(member).connect)
+
+
+async def meeting_command(command, username):
+    global recorder
+    async with _meeting_lock:
+        if command in ('start', 'join'):
+            if tracker.is_active:
+                return {'content': 'A meeting is already active. Use /meeting status.'}
+            channel = client.get_channel(int(meeting_tracker.FOUNDERS_VC_ID))
+            if channel is None:
+                return {'content': 'Founders VC is unavailable. Check the bot’s View Channel and Connect permissions.'}
+            members = [{'user_id': str(m.id), 'username': m.name, 'display_name': m.display_name}
+                       for m in channel.members if not m.bot]
+            if not members:
+                return {'content': 'Join Founders VC before starting a meeting.'}
+            if not groq_engine.get_groq_key():
+                return {'content': 'GROQ_API_KEY is missing; transcription cannot start.'}
+            # Announce capture in the actual voice channel before receiving any audio.
+            await channel.send('🎙️ Meeting recording is starting. Voice audio is sent to Groq for transcription; notes and summaries go to meeting-reports. Use /meeting end to stop.', allowed_mentions=discord.AllowedMentions.none())
+            tracker.start_meeting(username, members)
+            recorder = MeetingRecorder(tracker)
             try:
-                app = web.Application()
-                app.router.add_get('/', handle_health)
-                app.router.add_get('/health', handle_health)
-                runner = web.AppRunner(app)
-                await runner.setup()
-                site = web.TCPSite(runner, '0.0.0.0', p)
-                await site.start()
-                print(f"[HealthServer] Cloud healthcheck listening on port {p}")
-                break
-            except Exception:
-                continue
-    except Exception as e:
-        print(f"[HealthServer] Notice: {e}")
+                await recorder.start(channel)
+            except Exception as exc:
+                tracker.is_active = False
+                recorder = None
+                logging.error('Voice connection failed: %s', type(exc).__name__)
+                return {'content': 'Voice connection failed; recording did not start. Check View Channel/Connect permissions and host UDP access.'}
+            return {'content': '🎙️ Meeting started. Attendance tracking and voice reception are active. /meeting status shows received audio and transcript counts.'}
+        if command in ('end', 'stop'):
+            return await finish_meeting(locked=True)
+        if command in ('stats', 'leaderboard'):
+            return {'embeds': [tracker.get_stats_embed()]}
+        embed = tracker.get_status_embed()
+        if recorder:
+            embed.setdefault('fields', []).append({'name': 'Voice transcription', 'value': recorder.status(), 'inline': False})
+        return {'embeds': [embed]}
+
+
+async def finish_meeting(automatic=False, locked=False):
+    global recorder
+    if not locked:
+        async with _meeting_lock:
+            return await finish_meeting(automatic, locked=True)
+    if not tracker.is_active:
+        return {'content': 'No active meeting to end.'}
+    audio_status = recorder.status() if recorder else 'No voice capture'
+    if recorder:
+        await recorder.stop()
+        audio_status = recorder.status()
+        recorder = None
+    ok, embeds, summary = await asyncio.to_thread(tracker.end_meeting)
+    if ok:
+        embeds[0].setdefault('fields', []).append({'name': 'Audio capture', 'value': audio_status, 'inline': False})
+        channel = client.get_channel(int(tracker.reports_channel_id)) or await client.fetch_channel(int(tracker.reports_channel_id))
+        # Store cumulative stats in the existing private reports channel, surviving Render redeploys.
+        backup = json.dumps(tracker.stats).encode('utf-8')
+        try:
+            with closing(discord.File(io.BytesIO(backup), filename='meeting-stats.json')) as upload:
+                await channel.send(content='Meeting ended after 60 seconds of empty VC.' if automatic else None,
+                                   embeds=[discord.Embed.from_dict(e) for e in embeds], file=upload,
+                                   allowed_mentions=discord.AllowedMentions.none())
+        except discord.HTTPException:
+            return {'content': 'Meeting saved locally, but the report could not be posted. Check Send Messages, Embed Links and Attach Files permissions.'}
+    return {'content': summary}
+
+
+class RippleClient(discord.Client):
+    async def setup_hook(self):
+        self.monitor = asyncio.create_task(meeting_monitor_loop())
+
+    async def on_ready(self):
+        logging.info('Discord READY; bot=%s; message_content=%s', self.user.id, self.intents.message_content)
+        if not getattr(self, 'stats_restored', False):
+            self.stats_restored = True
+            channel = self.get_channel(int(tracker.reports_channel_id))
+            if channel:
+                try:
+                    async for message in channel.history(limit=100):
+                        if message.author.id != self.user.id:
+                            continue
+                        attachment = next((a for a in message.attachments if a.filename == 'meeting-stats.json' and a.size <= 8 * 1024 * 1024), None)
+                        if attachment:
+                            stats = json.loads(await attachment.read())
+                            if isinstance(stats.get('members'), dict) and isinstance(stats.get('history'), list) and stats.get('total_meetings', -1) > tracker.stats['total_meetings']:
+                                tracker.stats = stats
+                                await asyncio.to_thread(tracker._save_stats)
+                                logging.info('Restored cumulative meeting statistics')
+                            break
+                except (discord.HTTPException, ValueError, TypeError):
+                    logging.warning('Could not restore meeting statistics from reports channel')
+
+    async def on_interaction(self, interaction):
+        if interaction.type != discord.InteractionType.application_command:
+            return
+        _interactions[interaction.token] = interaction
+        member = {'user': {'id': str(interaction.user.id), 'username': interaction.user.name,
+                           'global_name': interaction.user.display_name}}
+        try:
+            await handle_interaction({'id': str(interaction.id), 'token': interaction.token,
+                                      'channel_id': str(interaction.channel_id), 'data': interaction.data, 'member': member})
+        finally:
+            _interactions.pop(interaction.token, None)
+
+    async def on_socket_response(self, payload):
+        # Existing message handlers consume Discord's raw payload, after SDK parsing/caching.
+        if payload.get('t') == 'MESSAGE_CREATE':
+            await handle_message(payload['d'])
+
+    async def on_voice_state_update(self, member, before, after):
+        if str(member.guild.id) != GUILD_ID or member.bot:
+            return
+        async with _meeting_lock:
+            tracker.on_voice_state_update(str(member.id), member.name, member.display_name,
+                                          str(before.channel.id) if before.channel else None,
+                                          str(after.channel.id) if after.channel else None)
+
+    async def on_raw_reaction_add(self, event):
+        if event.user_id == self.user.id or str(event.guild_id) != GUILD_ID:
+            return
+        role_id = ROLE_MAP.get(str(event.message_id), {}).get(event.emoji.name)
+        if role_id:
+            await modify_role(str(event.user_id), role_id, 'PUT')
+        elif event.emoji.name in FLAG_TO_LANG:
+            code, name = FLAG_TO_LANG[event.emoji.name]
+            message = await api_call(f'/channels/{event.channel_id}/messages/{event.message_id}')
+            if message.get('content'):
+                translated = await asyncio.to_thread(do_translate, message['content'], code)
+                await send_discord_reply(str(event.channel_id), f'{event.emoji.name} **{name}:**\n{translated}', str(event.message_id))
+
+    async def on_raw_reaction_remove(self, event):
+        if str(event.guild_id) == GUILD_ID and event.user_id != self.user.id:
+            role_id = ROLE_MAP.get(str(event.message_id), {}).get(event.emoji.name)
+            if role_id:
+                await modify_role(str(event.user_id), role_id, 'DELETE')
+
+
+intents = discord.Intents.default()
+intents.message_content = True
+client = RippleClient(intents=intents, enable_debug_events=True, allowed_mentions=discord.AllowedMentions.none())
+
 
 async def run_bot():
-    global _active_gateway_ws
-    gateway_url = 'wss://gateway.discord.gg/?v=10&encoding=json'
-    asyncio.create_task(meeting_monitor_loop())
-    asyncio.create_task(start_health_server())
-
-    while True:
-        try:
-            print("Connecting to Discord Gateway...")
-            import websockets
-            async with websockets.connect(gateway_url) as ws:
-                _active_gateway_ws = ws
-                hello = json.loads(await ws.recv())
-                heartbeat_interval = hello['d']['heartbeat_interval'] / 1000.0
-                print(f"Received HELLO. Heartbeat: {heartbeat_interval}s")
-
-                asyncio.create_task(send_heartbeat(ws, heartbeat_interval))
-
-                identify = {
-                    'op': 2,
-                    'd': {
-                        'token': TOKEN,
-                        'intents': 1665,  # 1537 | (1 << 7) for GUILD_VOICE_STATES
-                        'properties': {
-                            'os': 'windows',
-                            'browser': 'ripplebot',
-                            'device': 'ripplebot'
-                        }
-                    }
-                }
-                await ws.send(json.dumps(identify))
-                print("Identified with Gateway. Active and listening for chat, vision, imagine, purge, rate limiting, translation, and meetings...")
-
-                while True:
-                    msg = await ws.recv()
-                    data = json.loads(msg)
-                    t = data.get('t')
-                    d = data.get('d')
-
-                    if t == 'INTERACTION_CREATE':
-                        asyncio.create_task(handle_interaction(d))
-                    elif t == 'MESSAGE_CREATE':
-                        asyncio.create_task(handle_message(d))
-                    elif t == 'VOICE_STATE_UPDATE':
-                        uid = d.get('user_id')
-                        new_cid = d.get('channel_id')
-                        old_info = _guild_voice_states.get(uid) or {}
-                        old_cid = old_info.get('channel_id')
-                        member = d.get('member') or {}
-                        user = member.get('user') or {}
-                        u_name = user.get('username', 'Member')
-                        disp_name = member.get('nick') or user.get('global_name') or u_name
-
-                        if new_cid:
-                            _guild_voice_states[uid] = {
-                                'channel_id': new_cid,
-                                'username': u_name,
-                                'display_name': disp_name
-                            }
-                        else:
-                            _guild_voice_states.pop(uid, None)
-
-                        tracker.on_voice_state_update(
-                            user_id=uid,
-                            username=u_name,
-                            display_name=disp_name,
-                            old_channel_id=old_cid,
-                            new_channel_id=new_cid
-                        )
-                    elif t == 'MESSAGE_REACTION_ADD':
-                        mid = d.get('message_id')
-                        uid = d.get('user_id')
-                        channel_id = d.get('channel_id')
-                        emoji = d.get('emoji', {}).get('name')
-
-                        if uid == BOT_ID:
-                            continue
-
-                        if mid in ROLE_MAP:
-                            role_id = ROLE_MAP[mid].get(emoji)
-                            if role_id:
-                                print(f"Adding role {emoji} -> {role_id} for user {uid}")
-                                modify_role(uid, role_id, 'PUT')
-                            continue
-
-                        if emoji in FLAG_TO_LANG:
-                            tgt_code, tgt_name = FLAG_TO_LANG[emoji]
-                            try:
-                                msg_data = api_call(f'/channels/{channel_id}/messages/{mid}')
-                                text = msg_data.get('content', '')
-                                if text:
-                                    translated = do_translate(text, tgt_code, 'auto')
-                                    author_name = msg_data.get('author', {}).get('username', 'User')
-                                    embed = {
-                                        'description': f"**{emoji} {tgt_name} Translation** (by {author_name}):\n\n{translated}",
-                                        'color': 0x0ea5e9,
-                                        'footer': {'text': 'RippleBot Flag Translator'}
-                                    }
-                                    api_call(f'/channels/{channel_id}/messages', method='POST', data={
-                                        'embeds': [embed],
-                                        'message_reference': {'message_id': mid}
-                                    })
-                            except Exception as e:
-                                print(f"Flag translation failed: {e}")
-
-                    elif t == 'MESSAGE_REACTION_REMOVE':
-                        mid = d.get('message_id')
-                        uid = d.get('user_id')
-                        emoji = d.get('emoji', {}).get('name')
-                        if uid != BOT_ID and mid in ROLE_MAP:
-                            role_id = ROLE_MAP[mid].get(emoji)
-                            if role_id:
-                                print(f"Removing role {emoji} -> {role_id} for user {uid}")
-                                modify_role(uid, role_id, 'DELETE')
-
-        except Exception as e:
-            _active_gateway_ws = None
-            print(f"Gateway connection lost: {e}. Reconnecting in 5s...")
-            await asyncio.sleep(5)
+    if not TOKEN:
+        raise RuntimeError('DISCORD_BOT_TOKEN is required')
+    await start_health_server()
+    async with client:
+        await client.start(TOKEN)
 
 if __name__ == '__main__':
     print("=" * 60)
     print("             🌊 RIPPLEBOT SERVICE (AI-POWERED) 🌊")
     print("=" * 60)
+    logging.basicConfig(level=logging.INFO)
     asyncio.run(run_bot())

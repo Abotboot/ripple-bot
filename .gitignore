@@ -6,6 +6,8 @@ __pycache__/
 .Python
 env/
 venv/
+.venv/
+.codegraph/
 ENV/
 
 # Secrets & credentials

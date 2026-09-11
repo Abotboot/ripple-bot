@@ -1,66 +1,44 @@
-# 🌐 RippleBot 24/7 Free Cloud Hosting Guide
+# RippleBot deployment
 
-Run RippleBot 24/7 in the cloud with zero hosting fees and without keeping your PC awake.
+Use Python 3.12, install requirements.txt, and run `python -u ripple_bot_gateway.py`.
+Set DISCORD_BOT_TOKEN and GROQ_API_KEY in the host environment. Never commit credentials.
+Enable Message Content Intent in Discord Developer Portal for text commands.
 
----
+Bot permissions in Founders channels: View Channel, Connect, Send Messages, Embed Links,
+Attach Files and Read Message History. Manage Messages is required only for purge;
+Manage Roles for reaction roles; Manage Webhooks for /speak proxying.
 
-## Option 1: Koyeb (Recommended — 100% Free Forever, Never Sleeps)
+## Meetings
 
-Koyeb offers a **Free Eco tier** that runs 24/7 continuously without sleeping or requiring a credit card.
+Use /meeting start, status, end, stats inside Founders channels. Equivalent !meeting
+commands and !note <text> work with Message Content Intent enabled. Join the VC first.
+Starting announces recording in the voice channel. Voice is decrypted using Discord's
+negotiated DAVE session and sent to Groq Whisper in bounded segments. Audio stays in
+memory and is discarded after transcription. Status reports received audio packets,
+transcript segments, dropped packets and transcription failures.
+Ending waits for pending transcription before posting attendance and an AI summary.
+No transcript means no invented voice summary. Uploaded voice notes and !note also work.
 
-1. **Push code to GitHub**:
-   Create a new private GitHub repository and push this directory (`scratch/`).
-2. **Sign up at Koyeb**: [koyeb.com](https://www.koyeb.com/) (Sign in with GitHub).
-3. **Create Service**:
-   - Click **Create Web Service**.
-   - Choose **GitHub** and select your repository.
-   - Select **Dockerfile** as the build method (or buildpack `pip install -r requirements.txt`).
-   - Instance Type: **Eco Free** (Nano, 512MB RAM).
-   - Port: `8080` (HTTP healthcheck is built-in to `ripple_bot_gateway.py`).
-4. **Deploy**:
-   Click **Deploy**. RippleBot connects to Discord within 60 seconds and stays online 24/7!
+The pinned receive extension lacks built-in DAVE decoding. voice_capture.py uses its
+Opus sink API and the SDK's negotiated DAVE session; it never disables encryption or
+patches installed packages. Recheck integration when upgrading Discord dependencies.
+Linux needs libopus; the Dockerfile installs it. Native Render images must provide it.
 
----
+## Hosting and persistence
 
-## Option 2: Render.com (100% Free Web Service)
+Render Free can sleep and restart. It does not guarantee 24/7 operation, and its local
+filesystem is ephemeral. Completed reports include meeting-stats.json in the existing
+private reports channel. Startup restores the latest bot-authored snapshot from the
+last 100 messages. Failed report uploads are reported to the command user; those local
+stats remain vulnerable to restart. Active meetings interrupted by a restart cannot
+recover uncaptured audio. For continuous operation use an always-on host with outbound
+UDP and durable storage. Do not add a paid service without the owner's approval.
 
-Render provides a generous free tier for Python web services.
+/health returns 200 only when Discord is ready, otherwise 503. It includes voice counters
+without transcripts or credentials. Render's Live badge alone does not verify commands.
 
-1. **Push to GitHub**.
-2. **Sign up at Render**: [render.com](https://render.com/).
-3. **New Web Service**:
-   - Click **New +** -> **Web Service**.
-   - Connect your GitHub repository.
-   - Runtime: `Python 3`
-   - Build Command: `pip install -r requirements.txt`
-   - Start Command: `python -u ripple_bot_gateway.py`
-   - Instance Type: **Free**
-4. **Keep-Alive (Prevent Sleep)**:
-   - Render free web services go to sleep if inactive for 15 minutes.
-   - Set up a free monitor at [UptimeRobot.com](https://uptimerobot.com/) or [cron-job.org](https://cron-job.org/) to ping your Render URL every 10 minutes:
-     `https://your-bot-name.onrender.com/health`
-   - This keeps your bot running 24/7 forever for $0!
+## Verification
 
----
-
-## Option 3: Oracle Cloud Always Free VPS (True Dedicated Linux Server)
-
-Oracle Cloud provides **2 Always-Free Linux virtual machines** that run forever with zero cost.
-
-1. Create a free VM on Oracle Cloud.
-2. SSH into your VM:
-   ```bash
-   git clone <your-repo-url>
-   cd <your-repo>
-   docker build -t ripplebot .
-   docker run -d --restart=always --name ripplebot ripplebot
-   ```
-3. Docker will automatically keep the bot running and restart it if the server ever reboots.
-
----
-
-## File Summary in this Repo
-- `Dockerfile`: Production container with Debian, FFmpeg, and Python 3.12.
-- `requirements.txt`: Python package dependencies.
-- `Procfile`: Procfile for process-manager platforms.
-- `render.yaml`: Blueprint configuration for Render.
+Run `python -m unittest -v test_bot`. After deploying, verify Discord READY in logs.
+Start a test meeting in Discord, speak, confirm packet/transcript counters increase,
+then end and inspect the report. Check /meeting stats after restart for restoration.
