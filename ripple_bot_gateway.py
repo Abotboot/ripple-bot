@@ -18,6 +18,8 @@ import asyncio
 import json
 import urllib.request
 import urllib.parse
+import urllib.error
+import time
 import re
 import sys
 import os
@@ -118,14 +120,34 @@ HEADERS = {
 
 _webhook_cache = {}
 
-def api_call(endpoint, method='GET', data=None):
+def api_call(endpoint, method='GET', data=None, max_retries=3):
     url = f'{BASE_URL}{endpoint}'
     payload = json.dumps(data).encode('utf-8') if data is not None else None
-    req = urllib.request.Request(url, data=payload, headers=HEADERS, method=method)
-    with urllib.request.urlopen(req) as resp:
-        if resp.status == 204:
-            return None
-        return json.loads(resp.read().decode('utf-8'))
+    for attempt in range(max_retries):
+        try:
+            req = urllib.request.Request(url, data=payload, headers=HEADERS, method=method)
+            with urllib.request.urlopen(req, timeout=12) as resp:
+                if resp.status == 204:
+                    return None
+                return json.loads(resp.read().decode('utf-8'))
+        except urllib.error.HTTPError as e:
+            if e.code == 429:
+                retry_after = 1.0
+                try:
+                    err_body = json.loads(e.read().decode('utf-8'))
+                    retry_after = float(err_body.get('retry_after', 1.0))
+                except Exception:
+                    pass
+                print(f"[API] 429 rate limited on {endpoint}. Sleeping {retry_after}s (attempt {attempt+1}/{max_retries})...")
+                time.sleep(retry_after)
+                continue
+            print(f"[API] HTTP {e.code} error on {endpoint}: {e}")
+            raise e
+        except Exception as e:
+            if attempt == max_retries - 1:
+                print(f"[API] Call error on {endpoint}: {e}")
+                raise e
+            time.sleep(0.5)
 
 tracker = meeting_tracker.MeetingTracker(BOT_ID, api_call)
 _active_gateway_ws = None
@@ -299,35 +321,67 @@ async def send_heartbeat(ws, interval):
         except Exception:
             break
 
-def interaction_callback(i_id, i_token, payload):
+def interaction_callback(i_id, i_token, payload, max_retries=3):
     url = f'{BASE_URL}/interactions/{i_id}/{i_token}/callback'
-    req = urllib.request.Request(
-        url,
-        data=json.dumps(payload).encode('utf-8'),
-        headers={'Content-Type': 'application/json', 'User-Agent': 'DiscordBot (RippleBot, 1.0)'},
-        method='POST'
-    )
-    try:
-        with urllib.request.urlopen(req) as resp:
-            return True
-    except Exception as e:
-        print(f"[Interaction] Callback error: {e}")
-        return False
+    body = json.dumps(payload).encode('utf-8')
+    headers = {
+        'Content-Type': 'application/json',
+        'User-Agent': 'DiscordBot (RippleBot, 1.0)',
+        'Authorization': f'Bot {TOKEN}'
+    }
+    for attempt in range(max_retries):
+        try:
+            req = urllib.request.Request(url, data=body, headers=headers, method='POST')
+            with urllib.request.urlopen(req, timeout=6) as resp:
+                return True
+        except urllib.error.HTTPError as e:
+            if e.code == 429:
+                retry_after = 0.5
+                try:
+                    err_body = json.loads(e.read().decode('utf-8'))
+                    retry_after = float(err_body.get('retry_after', 0.5))
+                except Exception:
+                    pass
+                print(f"[Interaction] 429 on callback. Retrying in {retry_after}s (attempt {attempt+1}/{max_retries})...")
+                time.sleep(retry_after)
+                continue
+            print(f"[Interaction] Callback HTTP error {e.code}: {e}")
+            return False
+        except Exception as e:
+            print(f"[Interaction] Callback error: {e}")
+            return False
+    return False
 
-def interaction_edit_original(i_token, payload):
+def interaction_edit_original(i_token, payload, max_retries=3):
     url = f'{BASE_URL}/webhooks/{BOT_ID}/{i_token}/messages/@original'
-    req = urllib.request.Request(
-        url,
-        data=json.dumps(payload).encode('utf-8'),
-        headers={'Content-Type': 'application/json', 'User-Agent': 'DiscordBot (RippleBot, 1.0)'},
-        method='PATCH'
-    )
-    try:
-        with urllib.request.urlopen(req) as resp:
-            return True
-    except Exception as e:
-        print(f"[Interaction] Edit original error: {e}")
-        return False
+    body = json.dumps(payload).encode('utf-8')
+    headers = {
+        'Content-Type': 'application/json',
+        'User-Agent': 'DiscordBot (RippleBot, 1.0)',
+        'Authorization': f'Bot {TOKEN}'
+    }
+    for attempt in range(max_retries):
+        try:
+            req = urllib.request.Request(url, data=body, headers=headers, method='PATCH')
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                return True
+        except urllib.error.HTTPError as e:
+            if e.code == 429:
+                retry_after = 0.5
+                try:
+                    err_body = json.loads(e.read().decode('utf-8'))
+                    retry_after = float(err_body.get('retry_after', 0.5))
+                except Exception:
+                    pass
+                print(f"[Interaction] 429 on edit original. Retrying in {retry_after}s (attempt {attempt+1}/{max_retries})...")
+                time.sleep(retry_after)
+                continue
+            print(f"[Interaction] Edit original HTTP error {e.code}: {e}")
+            return False
+        except Exception as e:
+            print(f"[Interaction] Edit original error: {e}")
+            return False
+    return False
 
 async def handle_interaction(d):
     try:
@@ -566,6 +620,9 @@ async def handle_interaction(d):
             options = data.get('options', [])
             subcmd = options[0].get('name') if options else 'status'
 
+            # Defer interaction immediately to prevent 3-second Discord timeout
+            interaction_callback(i_id, i_token, {'type': 5})
+
             if subcmd == 'start':
                 current_in_vc = [
                     {'user_id': uid, 'username': info['username'], 'display_name': info['display_name']}
@@ -574,28 +631,29 @@ async def handle_interaction(d):
                 ]
                 ok, msg = tracker.start_meeting(user_name, current_in_vc)
                 if ok:
-                    await send_voice_state_update(GUILD_ID, meeting_tracker.FOUNDERS_VC_ID)
-                interaction_callback(i_id, i_token, {'type': 4, 'data': {'content': msg}})
+                    await send_voice_state_update(GUILD_ID, meeting_tracker.FOUNDERS_VC_ID, self_mute=False, self_deaf=True)
+                interaction_edit_original(i_token, {'content': msg})
                 return
 
             elif subcmd == 'end':
                 await send_voice_state_update(GUILD_ID, None)
-                ok, embeds, summary = tracker.end_meeting()
+                loop = asyncio.get_event_loop()
+                ok, embeds, summary = await loop.run_in_executor(None, tracker.end_meeting)
                 if ok and embeds:
                     api_call(f'/channels/{tracker.reports_channel_id}/messages', method='POST', data={'embeds': embeds})
-                    interaction_callback(i_id, i_token, {'type': 4, 'data': {'content': summary}})
+                    interaction_edit_original(i_token, {'content': summary})
                 else:
-                    interaction_callback(i_id, i_token, {'type': 4, 'data': {'content': summary}})
+                    interaction_edit_original(i_token, {'content': summary})
                 return
 
             elif subcmd == 'status':
                 embed = tracker.get_status_embed()
-                interaction_callback(i_id, i_token, {'type': 4, 'data': {'embeds': [embed]}})
+                interaction_edit_original(i_token, {'embeds': [embed]})
                 return
 
             elif subcmd == 'stats':
                 embed = tracker.get_stats_embed()
-                interaction_callback(i_id, i_token, {'type': 4, 'data': {'embeds': [embed]}})
+                interaction_edit_original(i_token, {'embeds': [embed]})
                 return
 
     except Exception as e:
