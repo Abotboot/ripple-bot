@@ -53,6 +53,19 @@ class TrackerTests(unittest.TestCase):
 
 
 class AsyncTests(unittest.IsolatedAsyncioTestCase):
+    async def test_sdk_message_event_reaches_text_command(self):
+        from discord.gateway import DiscordWebSocket
+        events = []
+        gateway = SimpleNamespace(_dispatch=lambda name, data: events.append((name, data)))
+        message = {'id': '1', 'channel_id': '2', 'author': {'id': '3'}, 'content': '!meeting status'}
+        DiscordWebSocket.debug_log_receive(gateway, json.dumps({'op': 0, 't': 'MESSAGE_CREATE', 'd': message}))
+        with patch.object(bot, 'handle_message', AsyncMock()) as handler:
+            for event, data in events:
+                await getattr(bot.client, 'on_' + event)(data)
+            handler.assert_awaited_once_with(message)
+            await bot.client.on_socket_raw_receive(json.dumps({'op': 11, 'd': None}))
+            handler.assert_awaited_once()
+
     async def test_login_429_waits_instead_of_crashing(self):
         response = SimpleNamespace(status=429, reason='Too Many Requests', headers={'Retry-After': '600'})
         fake_client = AsyncMock()

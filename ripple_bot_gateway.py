@@ -1058,8 +1058,9 @@ class RippleClient(discord.Client):
         finally:
             _interactions.pop(interaction.token, None)
 
-    async def on_socket_response(self, payload):
-        # Existing message handlers consume Discord's raw payload, after SDK parsing/caching.
+    async def on_socket_raw_receive(self, message):
+        # discord.py emits decompressed JSON text for this debug event.
+        payload = json.loads(message)
         if payload.get('t') == 'MESSAGE_CREATE':
             await handle_message(payload['d'])
 
