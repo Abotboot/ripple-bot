@@ -153,7 +153,7 @@ tracker = meeting_tracker.MeetingTracker(BOT_ID, api_call)
 _active_gateway_ws = None
 _guild_voice_states = {}  # uid -> {'channel_id': cid, 'username': str, 'display_name': str}
 
-async def send_voice_state_update(guild_id: str, channel_id: str = None, self_mute: bool = False, self_deaf: bool = True):
+async def send_voice_state_update(guild_id: str, channel_id: str = None, self_mute: bool = False, self_deaf: bool = False):
     global _active_gateway_ws
     if _active_gateway_ws:
         payload = {
@@ -336,13 +336,15 @@ def interaction_callback(i_id, i_token, payload, max_retries=3):
                 return True
         except urllib.error.HTTPError as e:
             if e.code == 429:
-                retry_after = 0.5
+                err_raw = ""
+                retry_after = 1.0
                 try:
-                    err_body = json.loads(e.read().decode('utf-8'))
-                    retry_after = float(err_body.get('retry_after', 0.5))
+                    err_raw = e.read().decode('utf-8')
+                    err_body = json.loads(err_raw)
+                    retry_after = float(err_body.get('retry_after', 1.0))
                 except Exception:
                     pass
-                print(f"[Interaction] 429 on callback. Retrying in {retry_after}s (attempt {attempt+1}/{max_retries})...")
+                print(f"[Interaction] 429 on callback. Response: {err_raw}. Retrying in {retry_after}s (attempt {attempt+1}/{max_retries})...")
                 time.sleep(retry_after)
                 continue
             print(f"[Interaction] Callback HTTP error {e.code}: {e}")
@@ -631,7 +633,7 @@ async def handle_interaction(d):
                 ]
                 ok, msg = tracker.start_meeting(user_name, current_in_vc)
                 if ok:
-                    await send_voice_state_update(GUILD_ID, meeting_tracker.FOUNDERS_VC_ID, self_mute=False, self_deaf=True)
+                    await send_voice_state_update(GUILD_ID, meeting_tracker.FOUNDERS_VC_ID, self_mute=False, self_deaf=False)
                 interaction_edit_original(i_token, {'content': msg})
                 return
 
@@ -836,6 +838,38 @@ async def handle_message(d):
             # Capture live in-meeting text messages (excluding commands)
             if content and not content.startswith(('!', '/', '?')):
                 tracker.add_transcript(author_name, content)
+
+        # 0. Meeting text commands: !meeting start | end | status | stats
+        m_mtg = re.match(r'^(?:!meeting|<@!?1546333781764345936>\s*meeting)\s*(start|end|status|stats)?', content, re.IGNORECASE)
+        if m_mtg:
+            sub = (m_mtg.group(1) or 'status').lower()
+            if sub == 'start':
+                current_in_vc = [
+                    {'user_id': uid, 'username': info['username'], 'display_name': info['display_name']}
+                    for uid, info in _guild_voice_states.items()
+                    if info.get('channel_id') == meeting_tracker.FOUNDERS_VC_ID and uid != BOT_ID
+                ]
+                ok, msg = tracker.start_meeting(author_name, current_in_vc)
+                if ok:
+                    await send_voice_state_update(GUILD_ID, meeting_tracker.FOUNDERS_VC_ID, self_mute=False, self_deaf=False)
+                api_call(f'/channels/{channel_id}/messages', method='POST', data={'content': msg, 'message_reference': {'message_id': msg_id}})
+                return
+            elif sub == 'end':
+                await send_voice_state_update(GUILD_ID, None)
+                loop = asyncio.get_event_loop()
+                ok, embeds, summary = await loop.run_in_executor(None, tracker.end_meeting)
+                if ok and embeds:
+                    api_call(f'/channels/{tracker.reports_channel_id}/messages', method='POST', data={'embeds': embeds})
+                api_call(f'/channels/{channel_id}/messages', method='POST', data={'content': summary, 'message_reference': {'message_id': msg_id}})
+                return
+            elif sub == 'status':
+                embed = tracker.get_status_embed()
+                api_call(f'/channels/{channel_id}/messages', method='POST', data={'embeds': [embed], 'message_reference': {'message_id': msg_id}})
+                return
+            elif sub == 'stats':
+                embed = tracker.get_stats_embed()
+                api_call(f'/channels/{channel_id}/messages', method='POST', data={'embeds': [embed], 'message_reference': {'message_id': msg_id}})
+                return
 
         # 1. Purge text command: !purge <amount> or @RippleBot purge <amount>
         m_purge = re.match(r'^(?:!purge|<@!?1546333781764345936>\s*purge)\s*(\d+)?', content, re.IGNORECASE)
