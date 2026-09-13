@@ -910,7 +910,16 @@ async def start_health_server():
     app.router.add_get('/health', health)
     runner = web.AppRunner(app)
     await runner.setup()
-    await web.TCPSite(runner, '0.0.0.0', int(os.environ.get('PORT', 8080))).start()
+    base_port = int(os.environ.get('PORT', 8080))
+    for p in [base_port, base_port + 1, base_port + 2, 0]:
+        try:
+            site = web.TCPSite(runner, '0.0.0.0', p)
+            await site.start()
+            logging.info('Healthcheck listening on port %s', p)
+            break
+        except OSError:
+            if p == 0:
+                raise
 
 def message_options(payload):
     result = {}
