@@ -344,8 +344,7 @@ class MeetingTracker:
             summary_embed = {
                 "title": f"🎯 Founders Meeting #{record['id']} — AI Executive Brief",
                 "description": ai_summary[:4000],
-                "color": 0x38bdf8,
-                "footer": {"text": "AI Synthesis powered by Groq (Qwen 3.8 27B)"}
+                "color": 0x38bdf8
             }
             result_embeds.append(summary_embed)
 

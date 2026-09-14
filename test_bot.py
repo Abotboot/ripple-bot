@@ -110,11 +110,12 @@ class AsyncTests(unittest.IsolatedAsyncioTestCase):
             await pending
 
     async def test_concurrent_ends_produce_one_flat_report(self):
-        tracker = meeting_tracker.MeetingTracker('99', None)
         channel = SimpleNamespace(send=AsyncMock())
-        with tempfile.TemporaryDirectory() as tmp, patch.object(meeting_tracker, 'STATS_FILE', tmp + '/stats.json'), patch.object(bot, 'tracker', tracker), patch.object(bot, 'recorder', None), patch.object(bot, '_meeting_lock', asyncio.Lock()), patch.object(bot.client, 'get_channel', return_value=channel):
-            tracker.start_meeting('A', [{'user_id': '1', 'username': 'A'}])
-            await asyncio.gather(bot.finish_meeting(True), bot.finish_meeting())
+        with tempfile.TemporaryDirectory() as tmp, patch.object(meeting_tracker, 'STATS_FILE', tmp + '/stats.json'):
+            tracker = meeting_tracker.MeetingTracker('99', None)
+            with patch.object(bot, 'tracker', tracker), patch.object(bot, 'recorder', None), patch.object(bot, '_meeting_lock', asyncio.Lock()), patch.object(bot.client, 'get_channel', return_value=channel):
+                tracker.start_meeting('A', [{'user_id': '1', 'username': 'A'}])
+                await asyncio.gather(bot.finish_meeting(True), bot.finish_meeting())
             self.assertEqual(tracker.stats['total_meetings'], 1)
             channel.send.assert_awaited_once()
             sent = channel.send.call_args.kwargs
