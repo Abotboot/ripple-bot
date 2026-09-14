@@ -44,6 +44,7 @@ class MeetingTracker:
         self.transcript_lines = []  # List of "Speaker: Text" strings
         self.empty_since = None
         self.reports_channel_id = REPORTS_CHANNEL_ID
+        self.active_vc_id = FOUNDERS_VC_ID
         self.stats = self._load_stats()
 
     def _load_stats(self) -> dict:
@@ -92,14 +93,15 @@ class MeetingTracker:
             print(f"[MeetingTracker] ensure_reports_channel error: {e}")
         return self.reports_channel_id
 
-    def start_meeting(self, started_by_name: str, initial_voice_members: list = None) -> tuple[bool, str]:
+    def start_meeting(self, started_by_name: str, initial_voice_members: list = None, vc_id: str = None) -> tuple[bool, str]:
         if self.is_active:
             elapsed = time.time() - self.start_time
-            return False, f"⚠️ A meeting is already active in Founders VC (running for **{format_duration(elapsed)}**)."
+            return False, f"⚠️ A meeting is already active in <#{self.active_vc_id}> (running for **{format_duration(elapsed)}**)."
 
         self.is_active = True
         self.start_time = time.time()
         self.started_by = started_by_name
+        self.active_vc_id = str(vc_id) if vc_id else FOUNDERS_VC_ID
         self.attendees = {}
         self.transcript_lines = []
         self.empty_since = None
@@ -121,7 +123,7 @@ class MeetingTracker:
 
         if not self.attendees:
             self.empty_since = self.start_time
-        return True, f"🎙️ **Founders Meeting Started!**\nTracking attendance and hours in <#{FOUNDERS_VC_ID}>. Type `/meeting end` or `!meeting end` when done."
+        return True, f"🎙️ **Meeting Started!**\nTracking attendance and hours in <#{self.active_vc_id}>. Type `/meeting end` or `!meeting end` when done."
 
     def add_transcript(self, speaker: str, text: str):
         if not self.is_active or not text:
@@ -144,8 +146,8 @@ class MeetingTracker:
 
         now = time.time()
 
-        # Joined Founders VC
-        if new_channel_id == FOUNDERS_VC_ID:
+        # Joined active VC
+        if new_channel_id == self.active_vc_id:
             self.empty_since = None
             if user_id not in self.attendees:
                 self.attendees[user_id] = {
@@ -159,22 +161,22 @@ class MeetingTracker:
                 self.attendees[user_id]["joined_at"] = now
                 self.attendees[user_id]["currently_in"] = True
                 self.attendees[user_id]["display_name"] = display_name or self.attendees[user_id]["display_name"]
-            print(f"[MeetingTracker] {username} joined Founders VC at {int(now)}")
+            print(f"[MeetingTracker] {username} joined active VC at {int(now)}")
 
-        # Left Founders VC
-        elif old_channel_id == FOUNDERS_VC_ID and new_channel_id != FOUNDERS_VC_ID:
+        # Left active VC
+        elif old_channel_id == self.active_vc_id and new_channel_id != self.active_vc_id:
             if user_id in self.attendees and self.attendees[user_id]["currently_in"]:
                 joined_at = self.attendees[user_id].get("joined_at", now)
                 delta = max(0.0, now - joined_at)
                 self.attendees[user_id]["total_seconds"] += delta
                 self.attendees[user_id]["currently_in"] = False
-                print(f"[MeetingTracker] {username} left Founders VC (+{int(delta)}s, total: {int(self.attendees[user_id]['total_seconds'])}s)")
+                print(f"[MeetingTracker] {username} left active VC (+{int(delta)}s, total: {int(self.attendees[user_id]['total_seconds'])}s)")
 
             # Check if all human members left
             still_in = [uid for uid, a in self.attendees.items() if a["currently_in"]]
             if not still_in:
                 self.empty_since = now
-                print(f"[MeetingTracker] Founders VC is empty. Auto-end countdown started.")
+                print(f"[MeetingTracker] Active VC is empty. Auto-end countdown started.")
 
     def check_auto_end(self, grace_period_secs: int = 60) -> bool:
         """Returns True if the VC has been empty longer than grace_period_secs."""
@@ -261,6 +263,7 @@ class MeetingTracker:
         self.attendees = {}
         self.transcript_lines = []
         self.empty_since = None
+        self.active_vc_id = FOUNDERS_VC_ID
 
         summary_text = f"✅ **Founders Meeting Ended!** Duration: **{format_duration(meeting_duration)}**. Full report sent to <#{self.reports_channel_id}>."
         return True, embeds, summary_text
@@ -328,8 +331,8 @@ class MeetingTracker:
             })
 
         main_embed = {
-            "title": f"📊 Founders Meeting #{record['id']} Report",
-            "description": f"Official meeting record for <#{FOUNDERS_VC_ID}>.\nLogged by **RippleBot**.",
+            "title": f"📊 Meeting #{record['id']} Report",
+            "description": f"Official meeting record for <#{self.active_vc_id}>.\nLogged by **RippleBot**.",
             "color": 0x0ea5e9,  # Ripple Cyan / Sky Blue
             "fields": fields,
             "footer": {
@@ -373,8 +376,8 @@ class MeetingTracker:
             lines.append("*Waiting for members to join Founders VC...*")
 
         return {
-            "title": "🎙️ Active Founders Meeting",
-            "description": f"Meeting in progress for <#{FOUNDERS_VC_ID}>.\nStarted by **{self.started_by}** <t:{int(self.start_time)}:R>.",
+            "title": "🎙️ Active Meeting Status",
+            "description": f"Meeting in progress for <#{self.active_vc_id}>.\nStarted by **{self.started_by}** <t:{int(self.start_time)}:R>.",
             "color": 0x22c55e,
             "fields": [
                 {

@@ -266,10 +266,27 @@ MUSIC_SLASH_COMMANDS = [
             }
         ]
     },
+    {
+        "name": "join",
+        "description": "Join your current voice channel or a specified channel",
+        "options": [
+            {
+                "type": 3,
+                "name": "channel",
+                "description": "Voice channel name or ID (leave blank to join your current VC)",
+                "required": False
+            }
+        ]
+    },
+    {
+        "name": "leave",
+        "description": "Disconnect bot from voice channel"
+    },
 ]
 
 
 async def execute_music_command(command: str, query: str, author_id: str, author_name: str, channel_id: str) -> dict:
+    global recorder
     guild = client.get_guild(int(GUILD_ID))
     channel = client.get_channel(int(channel_id)) if channel_id else None
     if not channel and channel_id:
@@ -296,7 +313,6 @@ async def execute_music_command(command: str, query: str, author_id: str, author
 
         user_vc = getattr(member, 'voice', None).channel if (member and getattr(member, 'voice', None)) else None
 
-        global recorder
         vc = (recorder.vc if recorder and getattr(recorder, 'vc', None) and recorder.vc.is_connected() else None)
         if not vc:
             vc = discord.utils.get(client.voice_clients, guild=guild)
@@ -310,6 +326,11 @@ async def execute_music_command(command: str, query: str, author_id: str, author
             except Exception as e:
                 logging.error('Failed to connect to voice channel: %s', e)
                 return {'content': f'⚠️ Could not connect to voice channel: {e}'}
+        elif user_vc and getattr(vc, 'channel', None) and vc.channel.id != user_vc.id and not queue.is_playing():
+            try:
+                await vc.move_to(user_vc)
+            except Exception as e:
+                logging.error('Failed moving to user voice channel: %s', e)
 
         try:
             track = await music_player.resolve_track(query, author_name)
@@ -396,6 +417,66 @@ async def execute_music_command(command: str, query: str, author_id: str, author
             return {'content': f'🔊 Volume set to **{int(vol * 100)}%**.'}
         except ValueError:
             return {'content': '⚠️ Invalid volume. Provide a number between 1 and 100.'}
+
+    elif command in ('join', 'summon'):
+        member = guild.get_member(int(author_id)) if guild and author_id else None
+        if not member and guild and author_id:
+            try:
+                member = await guild.fetch_member(int(author_id))
+            except Exception:
+                pass
+        user_vc = getattr(member, 'voice', None).channel if (member and getattr(member, 'voice', None)) else None
+
+        target_vc = None
+        if query:
+            q_clean = query.strip().strip('<#>').strip()
+            if q_clean.isdigit():
+                target_vc = client.get_channel(int(q_clean))
+                if not target_vc and guild:
+                    try:
+                        target_vc = await client.fetch_channel(int(q_clean))
+                    except Exception:
+                        pass
+            if not target_vc and guild:
+                for v in guild.voice_channels:
+                    if v.name.lower() == query.strip().lower():
+                        target_vc = v
+                        break
+
+        if not target_vc:
+            target_vc = user_vc
+
+        if not target_vc:
+            return {'content': '⚠️ Join a voice channel first, or specify a channel name/ID (e.g. `/join General` or `!join <#id>`).'}
+
+        from discord.ext import voice_recv
+        vc = (recorder.vc if recorder and getattr(recorder, 'vc', None) and recorder.vc.is_connected() else None)
+        if not vc:
+            vc = discord.utils.get(client.voice_clients, guild=guild)
+
+        try:
+            if vc and vc.is_connected():
+                if getattr(vc, 'channel', None) and vc.channel.id != target_vc.id:
+                    await vc.move_to(target_vc)
+            else:
+                vc = await target_vc.connect(cls=voice_recv.VoiceRecvClient, timeout=20, reconnect=True, self_deaf=False)
+            return {'content': f'🔊 Joined **{target_vc.name}**!'}
+        except Exception as e:
+            return {'content': f'⚠️ Could not connect to **{target_vc.name}**: {e}'}
+
+    elif command in ('leave', 'disconnect', 'dc'):
+        vc = (recorder.vc if recorder and getattr(recorder, 'vc', None) and recorder.vc.is_connected() else None)
+        if not vc:
+            vc = discord.utils.get(client.voice_clients, guild=guild)
+
+        if vc and vc.is_connected():
+            queue.stop()
+            try:
+                await vc.disconnect(force=True)
+            except Exception:
+                pass
+            return {'content': '👋 Left voice channel.'}
+        return {'content': '⚠️ Bot is not currently in any voice channel.'}
 
     return {'content': '⚠️ Unknown music command.'}
 
@@ -626,19 +707,20 @@ async def handle_interaction(d):
             await interaction_callback(i_id, i_token, {'type': 5, 'data': {'flags': 64}})
             interaction = _interactions[i_token]
             if not await can_use_meeting(interaction.user, channel_id):
-                await interaction_edit_original(i_token, {'content': 'Use meeting commands inside the Founders channels.'})
+                await interaction_edit_original(i_token, {'content': 'Use meeting commands inside the Founders channels or while in a voice channel.'})
                 return
             options = data.get('options', [])
             subcmd = options[0].get('name') if options else 'status'
-            result = await meeting_command(subcmd, user_name)
+            target_vc = getattr(interaction.user, 'voice', None).channel if getattr(interaction.user, 'voice', None) else None
+            result = await meeting_command(subcmd, user_name, target_vc)
             await interaction_edit_original(i_token, result)
             return
 
-        # 9. Music slash commands: /play, /skip, /pause, /resume, /stop, /queue, /nowplaying, /volume
-        if cname in ('play', 'skip', 'pause', 'resume', 'stop', 'queue', 'nowplaying', 'volume'):
+        # 9. Music / Voice slash commands: /play, /skip, /pause, /resume, /stop, /queue, /nowplaying, /volume, /join, /leave
+        if cname in ('play', 'skip', 'pause', 'resume', 'stop', 'queue', 'nowplaying', 'volume', 'join', 'leave'):
             await interaction_callback(i_id, i_token, {'type': 5})
             options = {opt['name']: opt['value'] for opt in data.get('options', [])}
-            query = options.get('query') or options.get('percent') or ''
+            query = options.get('query') or options.get('percent') or options.get('channel') or ''
             result = await execute_music_command(cname, str(query), user_id, user_name, channel_id)
             await interaction_edit_original(i_token, result)
             return
@@ -760,12 +842,13 @@ async def handle_message(d):
                         result = {'content': 'No active meeting. Use /meeting start first.'}
             else:
                 command = match.group(1) or {'startmeeting': 'start', 'endmeeting': 'end'}.get((match.group(2) or '').lower(), 'status')
-                result = await meeting_command(command.lower(), author_name)
+                target_vc = getattr(member, 'voice', None).channel if (member and getattr(member, 'voice', None)) else None
+                result = await meeting_command(command.lower(), author_name, target_vc)
             await api_call(f'/channels/{channel_id}/messages', method='POST', data={**result, 'message_reference': {'message_id': msg_id}})
             return
 
-        # 0.1 Music text commands: !play, !skip, !pause, !resume, !stop, !queue, !np, !volume
-        m_music = re.match(r'^(?:!(play|p|skip|next|pause|resume|stop|queue|q|nowplaying|np|volume|vol)|<@!?1546333781764345936>\s*(play|skip|pause|resume|stop|queue|nowplaying|volume))\b(?:\s+(.*))?$', content, re.IGNORECASE | re.DOTALL)
+        # 0.1 Music / Voice text commands: !play, !skip, !pause, !resume, !stop, !queue, !np, !volume, !join, !leave
+        m_music = re.match(r'^(?:!(play|p|skip|next|pause|resume|stop|queue|q|nowplaying|np|volume|vol|join|summon|leave|disconnect|dc)|<@!?1546333781764345936>\s*(play|skip|pause|resume|stop|queue|nowplaying|volume|join|leave))\b(?:\s+(.*))?$', content, re.IGNORECASE | re.DOTALL)
         if m_music:
             cmd = (m_music.group(1) or m_music.group(2) or '').lower()
             if cmd == 'p': cmd = 'play'
@@ -773,6 +856,8 @@ async def handle_message(d):
             elif cmd in ('q',): cmd = 'queue'
             elif cmd in ('np',): cmd = 'nowplaying'
             elif cmd in ('vol',): cmd = 'volume'
+            elif cmd in ('summon',): cmd = 'join'
+            elif cmd in ('dc', 'disconnect'): cmd = 'leave'
             q_arg = m_music.group(3) or ''
             result = await execute_music_command(cmd, q_arg, author_id, author_name, channel_id)
             await api_call(f'/channels/{channel_id}/messages', method='POST', data={**result, 'message_reference': {'message_id': msg_id}})
@@ -1159,9 +1244,9 @@ recorder = None
 
 
 async def can_use_meeting(member, channel_id):
-    if not member or not channel_id:
+    if not member:
         return False
-    channel = client.get_channel(int(channel_id))
+    channel = client.get_channel(int(channel_id)) if channel_id else None
     if not channel and channel_id:
         try:
             channel = await client.fetch_channel(int(channel_id))
@@ -1178,34 +1263,34 @@ async def can_use_meeting(member, channel_id):
             return False
     if str(member.guild.id) != GUILD_ID:
         return False
+
+    if channel and getattr(channel, 'category_id', None) == int(meeting_tracker.FOUNDERS_CATEGORY_ID):
+        return True
+    user_vc = getattr(member, 'voice', None).channel if getattr(member, 'voice', None) else None
+    if user_vc and user_vc.permissions_for(member).connect:
+        return True
     vc = client.get_channel(int(meeting_tracker.FOUNDERS_VC_ID))
-    if not vc and guild:
-        try:
-            vc = await client.fetch_channel(int(meeting_tracker.FOUNDERS_VC_ID))
-        except Exception:
-            pass
-    return bool(vc and channel and channel.category_id == int(meeting_tracker.FOUNDERS_CATEGORY_ID)
-                and vc.permissions_for(member).view_channel and vc.permissions_for(member).connect)
+    return bool(vc and vc.permissions_for(member).view_channel and vc.permissions_for(member).connect)
 
 
-async def meeting_command(command, username):
+async def meeting_command(command, username, target_vc=None):
     global recorder
     async with _meeting_lock:
         if command in ('start', 'join'):
             if tracker.is_active:
-                return {'content': 'A meeting is already active. Use /meeting status.'}
-            channel = client.get_channel(int(meeting_tracker.FOUNDERS_VC_ID))
+                return {'content': f'A meeting is already active in <#{tracker.active_vc_id}>. Use /meeting status.'}
+            channel = target_vc or client.get_channel(int(meeting_tracker.FOUNDERS_VC_ID))
             if channel is None:
-                return {'content': 'Founders VC is unavailable. Check the bot’s View Channel and Connect permissions.'}
+                return {'content': 'Voice channel is unavailable. Check the bot’s View Channel and Connect permissions.'}
             members = [{'user_id': str(m.id), 'username': m.name, 'display_name': m.display_name}
                        for m in channel.members if not m.bot]
             if not members:
-                return {'content': 'Join Founders VC before starting a meeting.'}
+                return {'content': f'Join <#{channel.id}> before starting a meeting.'}
             if not groq_engine.get_groq_key():
                 return {'content': 'GROQ_API_KEY is missing; transcription cannot start.'}
             # Announce capture in the actual voice channel before receiving any audio.
             await channel.send('🎙️ Meeting recording is starting. Voice audio is sent to Groq for transcription; notes and summaries go to meeting-reports. Use /meeting end to stop.', allowed_mentions=discord.AllowedMentions.none())
-            tracker.start_meeting(username, members)
+            tracker.start_meeting(username, members, vc_id=str(channel.id))
             recorder = MeetingRecorder(tracker)
             try:
                 await recorder.start(channel)
@@ -1214,7 +1299,7 @@ async def meeting_command(command, username):
                 recorder = None
                 logging.error('Voice connection failed: %s', type(exc).__name__)
                 return {'content': 'Voice connection failed; recording did not start. Check View Channel/Connect permissions and host UDP access.'}
-            return {'content': '🎙️ Meeting started. Attendance tracking and voice reception are active. /meeting status shows received audio and transcript counts.'}
+            return {'content': f'🎙️ Meeting started in <#{channel.id}>. Attendance tracking and voice reception are active. /meeting status shows received audio and transcript counts.'}
         if command in ('end', 'stop'):
             return await finish_meeting(locked=True)
         if command in ('stats', 'leaderboard'):

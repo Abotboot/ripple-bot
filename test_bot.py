@@ -198,6 +198,21 @@ class AsyncTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(len(queue.queue), 0)
             self.assertIsNone(queue.now_playing)
 
+    async def test_join_and_leave_voice_commands(self):
+        fake_vc = SimpleNamespace(id=999, name="Test VC", is_connected=Mock(return_value=True), disconnect=AsyncMock(), move_to=AsyncMock(), connect=AsyncMock())
+        fake_vc.connect = AsyncMock(return_value=fake_vc)
+        fake_member = SimpleNamespace(id="123", voice=SimpleNamespace(channel=fake_vc))
+        fake_guild = SimpleNamespace(id=1545531421081346101, get_member=Mock(return_value=fake_member), voice_channels=[fake_vc])
+
+        with patch.object(bot.client, 'get_guild', return_value=fake_guild), patch.object(bot.discord.utils, 'get', return_value=None):
+            res = await bot.execute_music_command('join', '', '123', 'User', '1')
+            self.assertIn('Joined', res['content'])
+
+        with patch.object(bot.client, 'get_guild', return_value=fake_guild), patch.object(bot.discord.utils, 'get', return_value=fake_vc):
+            res_leave = await bot.execute_music_command('leave', '', '123', 'User', '1')
+            self.assertIn('Left voice channel', res_leave['content'])
+            fake_vc.disconnect.assert_awaited_once()
+
 
 if __name__ == '__main__':
     unittest.main()
