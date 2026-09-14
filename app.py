@@ -1,7 +1,9 @@
 import os
 import sys
+import time
 import asyncio
 import logging
+import inspect
 import gradio as gr
 import ripple_bot_gateway
 
@@ -45,7 +47,24 @@ with gr.Blocks(title="RippleBot Cloud Hub") as demo:
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 7860))
+    launch_kwargs = {
+        "server_name": "0.0.0.0",
+        "server_port": port,
+        "prevent_thread_lock": True
+    }
+    sig = inspect.signature(demo.launch)
+    if "ssr_mode" in sig.parameters:
+        launch_kwargs["ssr_mode"] = False
+    if "ssr" in sig.parameters:
+        launch_kwargs["ssr"] = False
+
     demo.queue()
-    demo.launch(server_name="0.0.0.0", server_port=port, prevent_thread_lock=True)
+    demo.launch(**launch_kwargs)
     logging.info("Gradio dashboard active on port %s. Launching RippleBot Discord gateway on main thread...", port)
-    asyncio.run(ripple_bot_gateway.run_bot())
+
+    while True:
+        try:
+            asyncio.run(ripple_bot_gateway.run_bot())
+        except Exception as e:
+            logging.exception("Discord gateway encountered error: %s; restarting in 10s...", e)
+            time.sleep(10)
