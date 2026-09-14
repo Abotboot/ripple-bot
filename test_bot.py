@@ -15,6 +15,7 @@ import meeting_tracker
 import groq_engine
 import ripple_bot_gateway as bot
 from voice_capture import MeetingRecorder
+import music_player
 
 
 class TrackerTests(unittest.TestCase):
@@ -149,6 +150,53 @@ class AsyncTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(capture.dropped, 1)
         decoder.decode.assert_called_once()
         capture.cleanup()
+
+    async def test_music_queue_fifo_and_controls(self):
+        client = SimpleNamespace()
+        queue = music_player.GuildMusicQueue("123", client)
+        vc = SimpleNamespace(
+            is_connected=Mock(return_value=True),
+            is_playing=Mock(return_value=False),
+            is_paused=Mock(return_value=False),
+            play=Mock(),
+            stop=Mock(),
+            pause=Mock(),
+            resume=Mock(),
+        )
+        t1 = music_player.MusicTrack(title="Song 1", artist="Artist 1", source_url="https://song1", stream_url="http://audio1", duration=125, thumbnail="", requester="UserA")
+        t2 = music_player.MusicTrack(title="Song 2", artist="Artist 2", source_url="https://song2", stream_url="http://audio2", duration=60, thumbnail="", requester="UserB")
+        self.assertEqual(t1.format_duration(), "02:05")
+
+        with patch('music_player.discord.FFmpegPCMAudio'), patch('music_player.discord.PCMVolumeTransformer'):
+            pos1 = await queue.enqueue(t1, vc)
+            self.assertEqual(pos1, 1)
+            self.assertEqual(queue.now_playing.title, "Song 1")
+            vc.is_playing.return_value = True
+
+            pos2 = await queue.enqueue(t2, vc)
+            self.assertEqual(pos2, 1)
+            self.assertEqual(len(queue.queue), 1)
+            self.assertEqual(queue.queue[0].title, "Song 2")
+
+            queue.pause()
+            vc.pause.assert_called_once()
+            vc.is_paused.return_value = True
+            vc.is_playing.return_value = False
+
+            queue.resume()
+            vc.resume.assert_called_once()
+
+            vol = queue.set_volume(150)
+            self.assertEqual(vol, 1.0)
+            vol_low = queue.set_volume(-10)
+            self.assertEqual(vol_low, 0.01)
+
+            self.assertTrue(queue.skip())
+            vc.stop.assert_called_once()
+
+            queue.stop()
+            self.assertEqual(len(queue.queue), 0)
+            self.assertIsNone(queue.now_playing)
 
 
 if __name__ == '__main__':
