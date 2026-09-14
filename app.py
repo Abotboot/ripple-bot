@@ -1,26 +1,11 @@
 import os
 import sys
-import threading
 import asyncio
 import logging
 import gradio as gr
 import ripple_bot_gateway
 
-# Configure logging
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
-
-# Start discord bot in a dedicated background thread
-def run_discord_loop():
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-    try:
-        logging.info("Starting RippleBot Discord client loop...")
-        loop.run_until_complete(ripple_bot_gateway.run_bot())
-    except Exception as exc:
-        logging.exception("Discord bot loop stopped: %s", exc)
-
-bot_thread = threading.Thread(target=run_discord_loop, daemon=True, name="DiscordBotThread")
-bot_thread.start()
 
 def get_dashboard_metrics():
     is_ready = getattr(ripple_bot_gateway.client, "is_ready", lambda: False)()
@@ -60,4 +45,7 @@ with gr.Blocks(title="RippleBot Cloud Hub") as demo:
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 7860))
-    demo.launch(server_name="0.0.0.0", server_port=port)
+    demo.queue()
+    demo.launch(server_name="0.0.0.0", server_port=port, prevent_thread_lock=True)
+    logging.info("Gradio dashboard active on port %s. Launching RippleBot Discord gateway on main thread...", port)
+    asyncio.run(ripple_bot_gateway.run_bot())
