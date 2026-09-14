@@ -213,6 +213,49 @@ class AsyncTests(unittest.IsolatedAsyncioTestCase):
             self.assertIn('Left voice channel', res_leave['content'])
             fake_vc.disconnect.assert_awaited_once()
 
+    async def test_music_search_and_selection_view(self):
+        sample_tracks = [
+            music_player.MusicTrack(title="Song 1", artist="Artist 1", source_url="https://s1", stream_url="http://a1", duration=120, thumbnail="", requester="User"),
+            music_player.MusicTrack(title="Song 2", artist="Artist 2", source_url="https://s2", stream_url="http://a2", duration=180, thumbnail="", requester="User"),
+        ]
+        with patch('music_player.search_tracks', AsyncMock(return_value=sample_tracks)):
+            res = await bot.execute_music_command('search', 'yeat', '123', 'User', '1')
+            self.assertIn('embeds', res)
+            self.assertEqual(len(res['embeds'][0]['fields']), 2)
+            self.assertIn('view', res)
+            components = res['view'].to_components()
+            self.assertEqual(len(components[0]['components']), 2)
+            self.assertEqual(components[0]['components'][0]['custom_id'], 'mselect:0')
+            self.assertEqual(components[0]['components'][1]['custom_id'], 'mselect:1')
+
+    async def test_music_play_numeric_quick_select(self):
+        sample_tracks = [
+            music_player.MusicTrack(title="Song 1", artist="Artist 1", source_url="https://s1", stream_url="http://a1", duration=120, thumbnail="", requester="User"),
+            music_player.MusicTrack(title="Song 2", artist="Artist 2", source_url="https://s2", stream_url="http://a2", duration=180, thumbnail="", requester="User"),
+        ]
+        bot.recent_searches['1:123'] = sample_tracks
+        with patch.object(bot, 'play_resolved_track', AsyncMock(return_value={'content': 'played'})) as mock_play:
+            res = await bot.execute_music_command('play', '2', '123', 'User', '1')
+            self.assertEqual(res['content'], 'played')
+            mock_play.assert_awaited_once()
+            self.assertEqual(mock_play.call_args[0][0].title, "Song 2")
+
+    async def test_meeting_start_silent_vc_join(self):
+        fake_vc = SimpleNamespace(id=1545542223381274634, members=[SimpleNamespace(id=1, name='A', display_name='A', bot=False)], send=AsyncMock())
+        fake_recorder = SimpleNamespace(start=AsyncMock(), status=Mock(return_value="Idle"))
+        old_rec = bot.recorder
+        try:
+            with patch.object(bot.client, 'get_channel', return_value=fake_vc), \
+                 patch('groq_engine.get_groq_key', return_value='test_key'), \
+                 patch.object(bot.tracker, 'is_active', False), \
+                 patch.object(bot.tracker, 'start_meeting'), \
+                 patch('ripple_bot_gateway.MeetingRecorder', return_value=fake_recorder):
+                res = await bot.meeting_command('start', 'Founder', target_vc=fake_vc)
+                self.assertIn('Meeting started', res['content'])
+                fake_vc.send.assert_not_called()
+        finally:
+            bot.recorder = old_rec
+
 
 if __name__ == '__main__':
     unittest.main()

@@ -131,6 +131,14 @@ async def api_call(endpoint, method='GET', data=None, max_retries=3):
     kwargs = {'params': dict(urllib.parse.parse_qsl(query))} if query else {}
     if data is not None:
         kwargs['json'] = dict(data)
+        if 'view' in kwargs['json']:
+            view_obj = kwargs['json'].pop('view')
+            if hasattr(view_obj, 'to_components'):
+                kwargs['json']['components'] = view_obj.to_components()
+            try:
+                client.add_view(view_obj)
+            except Exception:
+                pass
         if 'content' in data or 'embeds' in data:
             kwargs['json'].setdefault('allowed_mentions', {'parse': []})
     return await client.http.request(route, **kwargs)
@@ -279,10 +287,108 @@ MUSIC_SLASH_COMMANDS = [
         ]
     },
     {
+        "name": "search",
+        "description": "Search and choose from top 5 song results",
+        "options": [
+            {
+                "type": 3,
+                "name": "query",
+                "description": "Song name or keywords to search",
+                "required": True
+            }
+        ]
+    },
+    {
         "name": "leave",
         "description": "Disconnect bot from voice channel"
     },
 ]
+
+recent_searches: dict[str, list[music_player.MusicTrack]] = {}
+
+
+class MusicSelectionView(discord.ui.View):
+    def __init__(self, track_count: int, timeout: float = 300):
+        super().__init__(timeout=timeout)
+        for i in range(min(track_count, 5)):
+            btn = discord.ui.Button(
+                label=f"Play #{i+1}",
+                style=discord.ButtonStyle.primary if i == 0 else discord.ButtonStyle.secondary,
+                custom_id=f"mselect:{i}"
+            )
+            self.add_item(btn)
+
+
+async def play_resolved_track(track: music_player.MusicTrack, author_id: str, author_name: str, channel_id: str, guild=None) -> dict:
+    global recorder
+    if not guild:
+        guild = client.get_guild(int(GUILD_ID))
+    channel = client.get_channel(int(channel_id)) if channel_id else None
+    if not channel and channel_id:
+        try:
+            channel = await client.fetch_channel(int(channel_id))
+        except Exception:
+            pass
+    if channel and getattr(channel, 'guild', None):
+        guild = channel.guild
+
+    queue = music_player.get_queue(str(guild.id if guild else GUILD_ID), client)
+
+    member = guild.get_member(int(author_id)) if guild and author_id else None
+    if not member and guild and author_id:
+        try:
+            member = await guild.fetch_member(int(author_id))
+        except Exception:
+            pass
+
+    user_vc = getattr(member, 'voice', None).channel if (member and getattr(member, 'voice', None)) else None
+
+    vc = (recorder.vc if recorder and getattr(recorder, 'vc', None) and recorder.vc.is_connected() else None)
+    if not vc:
+        vc = discord.utils.get(client.voice_clients, guild=guild)
+
+    if not vc:
+        if not user_vc:
+            return {'content': '⚠️ You must join a voice channel first so I know where to play!'}
+        from discord.ext import voice_recv
+        try:
+            vc = await user_vc.connect(cls=voice_recv.VoiceRecvClient, timeout=20, reconnect=True, self_deaf=False)
+        except Exception as e:
+            logging.error('Failed to connect to voice channel: %s', e)
+            return {'content': f'⚠️ Could not connect to voice channel: {e}'}
+    elif user_vc and getattr(vc, 'channel', None) and vc.channel.id != user_vc.id and not queue.is_playing():
+        try:
+            await vc.move_to(user_vc)
+        except Exception as e:
+            logging.error('Failed moving to user voice channel: %s', e)
+
+    pos = await queue.enqueue(track, vc, channel_to_notify=channel)
+    if pos == 1:
+        return {'content': f'🎶 **Now Playing:** **[{track.title}]({track.source_url})** by **{track.artist}** ({track.format_duration()})'}
+    else:
+        return {'content': f'✅ Added to queue at **#{pos}**: **[{track.title}]({track.source_url})** by **{track.artist}** ({track.format_duration()})'}
+
+
+async def handle_music_button(interaction: discord.Interaction, custom_id: str):
+    await interaction.response.defer(ephemeral=False)
+    channel_id = str(interaction.channel_id)
+    user_id = str(interaction.user.id)
+    user_name = interaction.user.display_name or interaction.user.name
+
+    try:
+        idx = int(custom_id.split(':')[1])
+    except (IndexError, ValueError):
+        await interaction.followup.send("⚠️ Invalid track selection.", ephemeral=True)
+        return
+
+    tracks = recent_searches.get(f"{channel_id}:{user_id}") or recent_searches.get(channel_id)
+    if not tracks or idx >= len(tracks):
+        await interaction.followup.send("⚠️ Search session expired or track not available. Run `/search` or `!search` again.", ephemeral=True)
+        return
+
+    track = tracks[idx]
+    result = await play_resolved_track(track, user_id, user_name, channel_id, interaction.guild)
+    await interaction.followup.send(**message_options(result))
 
 
 async def execute_music_command(command: str, query: str, author_id: str, author_name: str, channel_id: str) -> dict:
@@ -304,48 +410,54 @@ async def execute_music_command(command: str, query: str, author_id: str, author
         if not query:
             return {'content': '⚠️ Please provide a song name or Spotify/YouTube/SoundCloud URL.\nExample: `!play lofi beats` or `/play <spotify-url>`'}
 
-        member = guild.get_member(int(author_id)) if guild and author_id else None
-        if not member and guild and author_id:
-            try:
-                member = await guild.fetch_member(int(author_id))
-            except Exception:
-                pass
+        # Quick pick from recent search if query is digit 1-5
+        if query.isdigit() and 1 <= int(query) <= 5:
+            cached = recent_searches.get(f"{channel_id}:{author_id}") or recent_searches.get(channel_id)
+            if cached and int(query) <= len(cached):
+                track = cached[int(query) - 1]
+                return await play_resolved_track(track, author_id, author_name, channel_id, guild)
 
-        user_vc = getattr(member, 'voice', None).channel if (member and getattr(member, 'voice', None)) else None
-
-        vc = (recorder.vc if recorder and getattr(recorder, 'vc', None) and recorder.vc.is_connected() else None)
-        if not vc:
-            vc = discord.utils.get(client.voice_clients, guild=guild)
-
-        if not vc:
-            if not user_vc:
-                return {'content': '⚠️ You must join a voice channel first so I know where to play!'}
-            from discord.ext import voice_recv
-            try:
-                vc = await user_vc.connect(cls=voice_recv.VoiceRecvClient, timeout=20, reconnect=True, self_deaf=False)
-            except Exception as e:
-                logging.error('Failed to connect to voice channel: %s', e)
-                return {'content': f'⚠️ Could not connect to voice channel: {e}'}
-        elif user_vc and getattr(vc, 'channel', None) and vc.channel.id != user_vc.id and not queue.is_playing():
-            try:
-                await vc.move_to(user_vc)
-            except Exception as e:
-                logging.error('Failed moving to user voice channel: %s', e)
-
-        try:
-            track = await music_player.resolve_track(query, author_name)
-        except Exception as e:
-            logging.error('Failed resolving track for query %r: %s', query, e)
-            track = None
-
-        if not track:
+        tracks = await music_player.search_tracks(query, author_name, limit=5)
+        if not tracks:
             return {'content': '⚠️ Could not find or stream that audio track. Try another song or URL.'}
 
-        pos = await queue.enqueue(track, vc, channel_to_notify=channel)
-        if pos == 1:
-            return {'content': f'🎶 **Now Playing:** **[{track.title}]({track.source_url})** by **{track.artist}** ({track.format_duration()})'}
-        else:
-            return {'content': f'✅ Added to queue at **#{pos}**: **[{track.title}]({track.source_url})** by **{track.artist}** ({track.format_duration()})'}
+        recent_searches[f"{channel_id}:{author_id}"] = tracks
+        recent_searches[channel_id] = tracks
+
+        res = await play_resolved_track(tracks[0], author_id, author_name, channel_id, guild)
+        if len(tracks) > 1 and not query.startswith(('http://', 'https://')):
+            res['view'] = MusicSelectionView(len(tracks))
+            res['content'] = res.get('content', '') + f"\n💡 *Found {len(tracks)} versions. Click a button below or type `!play 1-{len(tracks)}` to switch/queue alternatives.*"
+        return res
+
+    elif command in ('search', 'find'):
+        query = (query or '').strip()
+        if not query:
+            return {'content': '⚠️ Please provide a song name to search.\nExample: `/search yeat big tonka` or `!search lofi`'}
+
+        tracks = await music_player.search_tracks(query, author_name, limit=5)
+        if not tracks:
+            return {'content': f'⚠️ Could not find any songs matching **{query}**.'}
+
+        recent_searches[f"{channel_id}:{author_id}"] = tracks
+        recent_searches[channel_id] = tracks
+
+        embed = discord.Embed(
+            title=f"🔍 Song Results for: {query[:50]}",
+            description="Click a button below or type `!play 1-5` to play a track.",
+            color=discord.Color.blue()
+        )
+        for i, t in enumerate(tracks):
+            embed.add_field(
+                name=f"{i+1}. {t.title[:60]}",
+                value=f"Artist: **{t.artist[:40]}** | Duration: `{t.format_duration()}` | [Link]({t.source_url})",
+                inline=False
+            )
+        if tracks[0].thumbnail:
+            embed.set_thumbnail(url=tracks[0].thumbnail)
+
+        view = MusicSelectionView(len(tracks))
+        return {'embeds': [embed.to_dict()], 'view': view}
 
     elif command in ('skip', 'next'):
         if queue.skip():
@@ -716,8 +828,8 @@ async def handle_interaction(d):
             await interaction_edit_original(i_token, result)
             return
 
-        # 9. Music / Voice slash commands: /play, /skip, /pause, /resume, /stop, /queue, /nowplaying, /volume, /join, /leave
-        if cname in ('play', 'skip', 'pause', 'resume', 'stop', 'queue', 'nowplaying', 'volume', 'join', 'leave'):
+        # 9. Music / Voice slash commands: /play, /skip, /pause, /resume, /stop, /queue, /nowplaying, /volume, /join, /leave, /search
+        if cname in ('play', 'skip', 'pause', 'resume', 'stop', 'queue', 'nowplaying', 'volume', 'join', 'leave', 'search', 'find'):
             await interaction_callback(i_id, i_token, {'type': 5})
             options = {opt['name']: opt['value'] for opt in data.get('options', [])}
             query = options.get('query') or options.get('percent') or options.get('channel') or ''
@@ -847,8 +959,8 @@ async def handle_message(d):
             await api_call(f'/channels/{channel_id}/messages', method='POST', data={**result, 'message_reference': {'message_id': msg_id}})
             return
 
-        # 0.1 Music / Voice text commands: !play, !skip, !pause, !resume, !stop, !queue, !np, !volume, !join, !leave
-        m_music = re.match(r'^(?:!(play|p|skip|next|pause|resume|stop|queue|q|nowplaying|np|volume|vol|join|summon|leave|disconnect|dc)|<@!?1546333781764345936>\s*(play|skip|pause|resume|stop|queue|nowplaying|volume|join|leave))\b(?:\s+(.*))?$', content, re.IGNORECASE | re.DOTALL)
+        # 0.1 Music / Voice text commands: !play, !skip, !pause, !resume, !stop, !queue, !np, !volume, !join, !leave, !search, !find
+        m_music = re.match(r'^(?:!(play|p|search|find|skip|next|pause|resume|stop|queue|q|nowplaying|np|volume|vol|join|summon|leave|disconnect|dc)|<@!?1546333781764345936>\s*(play|search|find|skip|pause|resume|stop|queue|nowplaying|volume|join|leave))\b(?:\s+(.*))?$', content, re.IGNORECASE | re.DOTALL)
         if m_music:
             cmd = (m_music.group(1) or m_music.group(2) or '').lower()
             if cmd == 'p': cmd = 'play'
@@ -1214,7 +1326,9 @@ def message_options(payload):
         if key in payload:
             result[key] = payload[key]
     if 'embeds' in payload:
-        result['embeds'] = [discord.Embed.from_dict(embed) for embed in payload['embeds']]
+        result['embeds'] = [discord.Embed.from_dict(embed) if isinstance(embed, dict) else embed for embed in payload['embeds']]
+    if 'view' in payload:
+        result['view'] = payload['view']
     result['allowed_mentions'] = discord.AllowedMentions.none()
     return result
 
@@ -1288,8 +1402,6 @@ async def meeting_command(command, username, target_vc=None):
                 return {'content': f'Join <#{channel.id}> before starting a meeting.'}
             if not groq_engine.get_groq_key():
                 return {'content': 'GROQ_API_KEY is missing; transcription cannot start.'}
-            # Announce capture in the actual voice channel before receiving any audio.
-            await channel.send('🎙️ Meeting recording is starting. Voice audio is sent to Groq for transcription; notes and summaries go to meeting-reports. Use /meeting end to stop.', allowed_mentions=discord.AllowedMentions.none())
             tracker.start_meeting(username, members, vc_id=str(channel.id))
             recorder = MeetingRecorder(tracker)
             try:
@@ -1371,6 +1483,16 @@ class RippleClient(discord.Client):
                 logging.debug('Could not register slash command %s: %s', cmd['name'], e)
 
     async def on_interaction(self, interaction):
+        if interaction.type == discord.InteractionType.component:
+            custom_id = interaction.data.get('custom_id', '')
+            if custom_id.startswith('mselect:'):
+                await handle_music_button(interaction, custom_id)
+                return
+            try:
+                self._connection._view_store.dispatch_view(interaction)
+            except Exception:
+                pass
+            return
         if interaction.type != discord.InteractionType.application_command:
             return
         _interactions[interaction.token] = interaction
