@@ -910,7 +910,7 @@ async def start_health_server():
     app.router.add_get('/health', health)
     runner = web.AppRunner(app)
     await runner.setup()
-    base_port = int(os.environ.get('PORT', 8080))
+    base_port = int(os.environ.get('HEALTH_PORT', 8080 if str(os.environ.get('PORT')) == '7860' else os.environ.get('PORT', 8080)))
     for p in [base_port, base_port + 1, base_port + 2, 0]:
         try:
             site = web.TCPSite(runner, '0.0.0.0', p)

@@ -20,3 +20,4 @@ bot_token.txt
 # Local data & logs
 meeting_stats.json
 *.log
+*.png

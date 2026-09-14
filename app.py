@@ -1,0 +1,63 @@
+import os
+import sys
+import threading
+import asyncio
+import logging
+import gradio as gr
+import ripple_bot_gateway
+
+# Configure logging
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+
+# Start discord bot in a dedicated background thread
+def run_discord_loop():
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    try:
+        logging.info("Starting RippleBot Discord client loop...")
+        loop.run_until_complete(ripple_bot_gateway.run_bot())
+    except Exception as exc:
+        logging.exception("Discord bot loop stopped: %s", exc)
+
+bot_thread = threading.Thread(target=run_discord_loop, daemon=True, name="DiscordBotThread")
+bot_thread.start()
+
+def get_dashboard_metrics():
+    is_ready = getattr(ripple_bot_gateway.client, "is_ready", lambda: False)()
+    bot_status = "🟢 Connected & Active" if is_ready else "🟡 Connecting to Discord..."
+    user_info = str(ripple_bot_gateway.client.user) if is_ready and ripple_bot_gateway.client.user else "Pending login"
+    
+    tracker = ripple_bot_gateway.tracker
+    meeting_status = "🔴 Meeting in Progress" if tracker.is_active else "⚪ Idle (No active meeting)"
+    channel = str(tracker.voice_channel_id) if tracker.is_active else "None"
+    total_meetings = str(tracker.stats.get("total_meetings", 0))
+    
+    recorder = getattr(ripple_bot_gateway, "recorder", None)
+    voice_status = recorder.status() if recorder else "Idle (Waiting for meeting)"
+    
+    return bot_status, user_info, meeting_status, channel, total_meetings, voice_status
+
+with gr.Blocks(title="RippleBot Cloud Hub") as demo:
+    gr.Markdown("# 🌊 RippleBot Cloud Hub\n24/7 Voice & Meeting Assistant on Hugging Face Spaces")
+    with gr.Row():
+        status_box = gr.Textbox(label="Gateway Status", value="Initializing...", interactive=False)
+        user_box = gr.Textbox(label="Logged In As", value="Checking...", interactive=False)
+    with gr.Row():
+        meeting_box = gr.Textbox(label="Current Meeting", value="Checking...", interactive=False)
+        channel_box = gr.Textbox(label="Voice Channel", value="Checking...", interactive=False)
+    with gr.Row():
+        meetings_box = gr.Textbox(label="Total Meetings Logged", value="0", interactive=False)
+        voice_box = gr.Textbox(label="DAVE / Voice Pipeline", value="Checking...", interactive=False)
+    refresh_btn = gr.Button("🔄 Refresh Status", variant="primary")
+    refresh_btn.click(
+        fn=get_dashboard_metrics,
+        outputs=[status_box, user_box, meeting_box, channel_box, meetings_box, voice_box]
+    )
+    demo.load(
+        fn=get_dashboard_metrics,
+        outputs=[status_box, user_box, meeting_box, channel_box, meetings_box, voice_box]
+    )
+
+if __name__ == "__main__":
+    port = int(os.environ.get("PORT", 7860))
+    demo.launch(server_name="0.0.0.0", server_port=port)
