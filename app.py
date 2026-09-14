@@ -7,6 +7,14 @@ import inspect
 import gradio as gr
 import ripple_bot_gateway
 
+try:
+    import spaces
+    @spaces.GPU
+    def gpu_pipeline_worker():
+        return True
+except Exception:
+    pass
+
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 
 def get_dashboard_metrics():
