@@ -2,6 +2,7 @@
 import asyncio
 import json
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -301,6 +302,61 @@ class MusicGuardTests(unittest.IsolatedAsyncioTestCase):
             result = await bot.execute_music_command_guarded('skip', '', 'u', 'A', '2')
         self.assertEqual(result['content'], 'ok')
         self.assertNotIn('u', bot._music_busy)
+
+
+class SearchFallbackTests(unittest.IsolatedAsyncioTestCase):
+    """YouTube bot-block fallbacks: SoundCloud, then Piped, plus stream gating."""
+
+    def test_direct_media_url_gating(self):
+        self.assertTrue(music_player._is_direct_media_url('https://rr3---sn-x.googlevideo.com/videoplayback?id=abc'))
+        self.assertTrue(music_player._is_direct_media_url('https://pipedproxy-xyz.kargn.net/_hx_/stream/abc'))
+        self.assertTrue(music_player._is_direct_media_url('https://cf.sc-cdn.net/audio.mp3'))
+        self.assertFalse(music_player._is_direct_media_url('https://www.youtube.com/watch?v=AvQYE9JoaZA'))
+        self.assertFalse(music_player._is_direct_media_url('https://api.soundcloud.com/tracks/1241027662'))
+        self.assertFalse(music_player._is_direct_media_url(''))
+
+    async def test_search_falls_back_to_soundcloud(self):
+        entry = {'title': 'Big tonka', 'uploader': 'Yeat', 'url': 'https://api.soundcloud.com/tracks/1',
+                 'webpage_url': 'https://api.soundcloud.com/tracks/1', 'duration': 100, 'thumbnail': ''}
+        with patch.object(music_player, '_flat_entries_sync', side_effect=TimeoutError('blocked')), \
+             patch.object(music_player, '_sc_entries_sync', Mock(return_value=[entry])) as sc, \
+             patch.object(music_player, '_piped_search_sync', Mock()) as piped:
+            tracks = await music_player.search_tracks('big tonka', 'T', resolve_first=False)
+        sc.assert_called_once()
+        piped.assert_not_called()
+        self.assertEqual(len(tracks), 1)
+        self.assertEqual(tracks[0].title, 'Big tonka')
+
+    async def test_search_falls_back_to_piped_when_yt_and_sc_fail(self):
+        entry = {'title': 'Big tonka', 'uploader': 'Yeat', 'duration': 150,
+                 'thumbnail': 't.png', 'webpage_url': 'https://www.youtube.com/watch?v=AvQYE9JoaZA'}
+        with patch.object(music_player, '_flat_entries_sync', side_effect=TimeoutError('blocked')), \
+             patch.object(music_player, '_sc_entries_sync', side_effect=TimeoutError('blocked')), \
+             patch.object(music_player, '_piped_search_sync', Mock(return_value=[entry])) as piped:
+            tracks = await music_player.search_tracks('big tonka', 'T', resolve_first=False)
+        piped.assert_called_once()
+        self.assertEqual(tracks[0].artist, 'Yeat')
+        # The watch-page URL must NOT be treated as a playable stream.
+        self.assertEqual(tracks[0].stream_url, '')
+
+    async def test_search_youtube_failure_does_not_hang_on_timeout(self):
+        def slow(*a, **k):
+            time.sleep(30)
+            return []
+        with patch.object(music_player, '_flat_entries_sync', slow), \
+             patch.object(music_player, '_sc_entries_sync', Mock(return_value=[])), \
+             patch.object(music_player, '_piped_search_sync', Mock(return_value=[])):
+            tracks = await asyncio.wait_for(music_player.search_tracks('x', 'T', resolve_first=False), 30)
+        self.assertEqual(tracks, [])
+
+    async def test_get_stream_info_piped_fallback(self):
+        info = {'url': 'https://pipedproxy-x.kargn.net/_hx_/stream/abc', 'duration': 150}
+        with patch.object(music_player, '_stream_cache', {}), \
+             patch.object(music_player, '_extract_info_sync', side_effect=Exception('Sign in to confirm')), \
+             patch.object(music_player, '_piped_video_sync', Mock(return_value=info)) as piped:
+            result = await music_player.get_stream_info('https://www.youtube.com/watch?v=AvQYE9JoaZA')
+        piped.assert_called_once()
+        self.assertEqual(result['url'], info['url'])
 
 
 if __name__ == '__main__':

@@ -334,7 +334,7 @@ recent_searches: dict[str, list[music_player.MusicTrack]] = {}
 # In-flight play/search requests, per user (debounce so repeated requests
 # don't stack up parallel yt-dlp searches).
 _music_busy: set[str] = set()
-MUSIC_SEARCH_TIMEOUT = 45  # seconds; a song search should never take longer
+MUSIC_SEARCH_TIMEOUT = 75  # seconds; covers the full fallback cascade (yt -> sc -> piped)
 # (yt-dlp's socket_timeout only caps individual socket reads, not a whole
 # stalled extraction - this wait_for is what actually bounds /play)
 
