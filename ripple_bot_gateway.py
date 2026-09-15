@@ -19,7 +19,6 @@ import json
 import urllib.request
 import urllib.parse
 import urllib.error
-import time
 import re
 import sys
 import os
@@ -29,13 +28,13 @@ from contextlib import closing
 import discord
 from voice_capture import MeetingRecorder
 
-from deep_translator import GoogleTranslator, MyMemoryTranslator
+from deep_translator import GoogleTranslator
 import groq_engine
-import water_knowledge
 import rate_limiter
 import image_gen
 import meeting_tracker
 import music_player
+import extras
 
 if sys.platform == 'win32':
     sys.stdout.reconfigure(encoding='utf-8')
@@ -298,6 +297,32 @@ MUSIC_SLASH_COMMANDS = [
             }
         ]
     },
+    {"name": "loop", "description": "Toggle looping the current song"},
+    {"name": "shuffle", "description": "Shuffle the upcoming queue"},
+    {
+        "name": "remove",
+        "description": "Remove a song from the queue by position",
+        "options": [
+            {
+                "type": 4,
+                "name": "position",
+                "description": "Queue position to remove (2+; 1 is playing)",
+                "required": True
+            }
+        ]
+    },
+    {
+        "name": "playtop",
+        "description": "Queue a song to play next (skips the line)",
+        "options": [
+            {
+                "type": 3,
+                "name": "query",
+                "description": "Song name or Spotify/YouTube/SoundCloud link",
+                "required": True
+            }
+        ]
+    },
     {
         "name": "leave",
         "description": "Disconnect bot from voice channel"
@@ -319,8 +344,7 @@ class MusicSelectionView(discord.ui.View):
             self.add_item(btn)
 
 
-async def play_resolved_track(track: music_player.MusicTrack, author_id: str, author_name: str, channel_id: str, guild=None) -> dict:
-    global recorder
+async def play_resolved_track(track: music_player.MusicTrack, author_id: str, author_name: str, channel_id: str, guild=None, front: bool = False) -> dict:
     if not guild:
         guild = client.get_guild(int(GUILD_ID))
     channel = client.get_channel(int(channel_id)) if channel_id else None
@@ -362,7 +386,7 @@ async def play_resolved_track(track: music_player.MusicTrack, author_id: str, au
         except Exception as e:
             logging.error('Failed moving to user voice channel: %s', e)
 
-    pos = await queue.enqueue(track, vc, channel_to_notify=channel)
+    pos = await queue.enqueue(track, vc, channel_to_notify=channel, front=front)
     if pos == 1:
         return {'content': f'🎶 **Now Playing:** **[{track.title}]({track.source_url})** by **{track.artist}** ({track.format_duration()})'}
     else:
@@ -392,7 +416,6 @@ async def handle_music_button(interaction: discord.Interaction, custom_id: str):
 
 
 async def execute_music_command(command: str, query: str, author_id: str, author_name: str, channel_id: str) -> dict:
-    global recorder
     guild = client.get_guild(int(GUILD_ID))
     channel = client.get_channel(int(channel_id)) if channel_id else None
     if not channel and channel_id:
@@ -405,7 +428,7 @@ async def execute_music_command(command: str, query: str, author_id: str, author
 
     queue = music_player.get_queue(str(guild.id if guild else GUILD_ID), client)
 
-    if command == 'play':
+    if command in ('play', 'playtop'):
         query = (query or '').strip()
         if not query:
             return {'content': '⚠️ Please provide a song name or Spotify/YouTube/SoundCloud URL.\nExample: `!play lofi beats` or `/play <spotify-url>`'}
@@ -415,7 +438,7 @@ async def execute_music_command(command: str, query: str, author_id: str, author
             cached = recent_searches.get(f"{channel_id}:{author_id}") or recent_searches.get(channel_id)
             if cached and int(query) <= len(cached):
                 track = cached[int(query) - 1]
-                return await play_resolved_track(track, author_id, author_name, channel_id, guild)
+                return await play_resolved_track(track, author_id, author_name, channel_id, guild, front=(command == 'playtop'))
 
         tracks = await music_player.search_tracks(query, author_name, limit=5)
         if not tracks:
@@ -424,7 +447,7 @@ async def execute_music_command(command: str, query: str, author_id: str, author
         recent_searches[f"{channel_id}:{author_id}"] = tracks
         recent_searches[channel_id] = tracks
 
-        res = await play_resolved_track(tracks[0], author_id, author_name, channel_id, guild)
+        res = await play_resolved_track(tracks[0], author_id, author_name, channel_id, guild, front=(command == 'playtop'))
         if len(tracks) > 1 and not query.startswith(('http://', 'https://')):
             res['view'] = MusicSelectionView(len(tracks))
             res['content'] = res.get('content', '') + f"\n💡 *Found {len(tracks)} versions. Click a button below or type `!play 1-{len(tracks)}` to switch/queue alternatives.*"
@@ -575,6 +598,22 @@ async def execute_music_command(command: str, query: str, author_id: str, author
             return {'content': f'🔊 Joined **{target_vc.name}**!'}
         except Exception as e:
             return {'content': f'⚠️ Could not connect to **{target_vc.name}**: {e}'}
+
+    elif command == 'loop':
+        queue.loop = not queue.loop
+        return {'content': f'🔁 Loop is now **{"ON" if queue.loop else "OFF"}**.'}
+
+    elif command == 'shuffle':
+        count = queue.shuffle()
+        return {'content': f'🔀 Shuffled **{count}** upcoming track(s).' if count else '📭 The queue is empty.'}
+
+    elif command == 'remove':
+        if not (query or '').strip().isdigit():
+            return {'content': '⚠️ Provide a queue position, e.g. `!remove 2`.'}
+        removed = queue.remove(int(query.strip()))
+        if removed:
+            return {'content': f"🗑️ Removed **{removed.title}** from the queue."}
+        return {'content': '⚠️ No track at that queue position.'}
 
     elif command in ('leave', 'disconnect', 'dc'):
         vc = (recorder.vc if recorder and getattr(recorder, 'vc', None) and recorder.vc.is_connected() else None)
@@ -760,7 +799,7 @@ async def handle_interaction(d):
                 await api_call(f'/channels/{channel_id}/messages', method='POST', data={
                     'content': f"**{user_name}** ({tgt_name}): {translated}"
                 })
-                await interaction_edit_original(i_token, {'content': f"✅ Sent!"})
+                await interaction_edit_original(i_token, {'content': '✅ Sent!'})
             return
 
         # 6. Translate to English (Context Menu)
@@ -828,11 +867,28 @@ async def handle_interaction(d):
             await interaction_edit_original(i_token, result)
             return
 
-        # 9. Music / Voice slash commands: /play, /skip, /pause, /resume, /stop, /queue, /nowplaying, /volume, /join, /leave, /search
-        if cname in ('play', 'skip', 'pause', 'resume', 'stop', 'queue', 'nowplaying', 'volume', 'join', 'leave', 'search', 'find'):
+        # 9. Extras slash commands: moderation, leveling, reminders, fun, info
+        if cname in {c['name'] for c in extras.SLASH_COMMANDS}:
+            await interaction_callback(i_id, i_token, {'type': 5})
+            raw_options = data.get('options', [])
+            sub = ''
+            raw_opts = raw_options[0].get('options') if raw_options else None
+            if raw_opts:
+                sub = raw_options[0]['name']
+                options = {o['name']: o['value'] for o in raw_opts if o.get('value') is not None}
+            else:
+                options = {opt['name']: opt['value'] for opt in raw_options if opt.get('value') is not None}
+            options['_sub'] = sub
+            result = await extras.handle_slash(_interactions[i_token], cname, options)
+            if result:
+                await interaction_edit_original(i_token, result)
+            return
+
+        # 10. Music / Voice slash commands: /play, /skip, /pause, /resume, /stop, /queue, /nowplaying, /volume, /join, /leave, /search, /loop, /shuffle, /remove, /playtop
+        if cname in ('play', 'playtop', 'skip', 'pause', 'resume', 'stop', 'queue', 'nowplaying', 'volume', 'join', 'leave', 'search', 'find', 'loop', 'shuffle', 'remove'):
             await interaction_callback(i_id, i_token, {'type': 5})
             options = {opt['name']: opt['value'] for opt in data.get('options', [])}
-            query = options.get('query') or options.get('percent') or options.get('channel') or ''
+            query = options.get('query') or options.get('percent') or options.get('channel') or options.get('position') or ''
             result = await execute_music_command(cname, str(query), user_id, user_name, channel_id)
             await interaction_edit_original(i_token, result)
             return
@@ -925,6 +981,40 @@ async def handle_message(d):
 
         if content.startswith(('!', '?')):
             logging.info('Received prefix command %r in channel %s from %s', content, channel_id, author_name)
+
+        # AutoMod: delete and warn rule-breaking messages before anything else.
+        if await extras.run_automod(d):
+            return
+
+        # XP leveling (MEE6-style, 60s cooldown per user).
+        leveled = extras.award_xp(author_id, author_name)
+        if leveled:
+            try:
+                await api_call(f'/channels/{channel_id}/messages', method='POST', data={
+                    'content': f'🎉 <@{author_id}> just reached level **{leveled}**!',
+                    'allowed_mentions': {'parse': ['users']},
+                    'message_reference': {'message_id': msg_id},
+                })
+            except Exception:
+                pass
+
+        # Extras prefix commands: !warn, !rank, !remind, !8ball, !poll, ...
+        if re.match(r'^[!?]\w', content):
+            channel = client.get_channel(int(channel_id))
+            guild = getattr(channel, 'guild', None) or client.get_guild(int(GUILD_ID))
+            member = guild.get_member(int(author_id)) if (guild and author_id) else None
+            result = await extras.handle_prefix(content, author_id, author_name, channel_id, msg_id, member, channel)
+            if result:
+                if result.get('__poll__'):
+                    question = result['__poll__']
+                    if channel:
+                        poll_msg = await channel.send(f'📊 **{question}**\n*by {author_name}*')
+                        for emoji in ('👍', '👎', '🤷'):
+                            await poll_msg.add_reaction(emoji)
+                    return
+                await api_call(f'/channels/{channel_id}/messages', method='POST',
+                               data={**result, 'message_reference': {'message_id': msg_id}})
+                return
 
         # Meeting commands share the same serialized lifecycle as slash commands.
         match = re.fullmatch(r'(?:!meeting|<@!?1546333781764345936>\s*meeting)(?:\s+(start|join|end|stop|status|stats|leaderboard))?|!(startmeeting|endmeeting)|!note\s+(.+)', content, re.IGNORECASE | re.DOTALL)
@@ -1450,9 +1540,67 @@ async def finish_meeting(automatic=False, locked=False):
     return {'content': summary}
 
 
+_seen_messages: set[str] = set()
+
+
+def _mark_seen(msg_id) -> bool:
+    """Deduplicates MESSAGE_CREATE handling across the raw-socket and SDK event paths."""
+    key = str(msg_id)
+    if len(_seen_messages) > 1024:
+        _seen_messages.clear()
+    if key in _seen_messages:
+        return False
+    _seen_messages.add(key)
+    return True
+
+
+def message_payload(message: discord.Message) -> dict:
+    """Converts a discord.Message into the raw-gateway dict shape handle_message expects."""
+    def convert(target: discord.Message) -> dict:
+        return {
+            'id': str(target.id),
+            'channel_id': str(target.channel.id),
+            'guild_id': str(target.guild.id) if target.guild else None,
+            'content': target.content or '',
+            'author': {'id': str(target.author.id), 'username': target.author.name,
+                       'global_name': getattr(target.author, 'global_name', None), 'bot': target.author.bot},
+            'attachments': [{'id': str(a.id), 'url': a.url, 'filename': a.filename,
+                             'content_type': a.content_type} for a in target.attachments],
+            'embeds': [e.to_dict() for e in target.embeds],
+            'mentions': [{'id': str(u.id), 'username': u.name, 'bot': u.bot} for u in target.mentions],
+            'message_reference': ({'message_id': str(target.reference.message_id),
+                                   'channel_id': str(target.reference.channel_id)}
+                                  if target.reference else None),
+            'referenced_message': convert(target.referenced_message) if target.referenced_message else None,
+        }
+
+    return convert(message)
+
+
+async def music_watchdog_loop():
+    """Leaves voice and stops playback when nobody is listening."""
+    await client.wait_until_ready()
+    while True:
+        await asyncio.sleep(60)
+        try:
+            for q in music_player.all_queues():
+                vc = q.voice_client
+                if not vc or not vc.is_connected():
+                    continue
+                humans = [m for m in getattr(vc.channel, 'members', []) if not m.bot]
+                if not humans and (q.is_playing() or q.is_paused() or q.now_playing or q.queue):
+                    q.stop()
+                    await vc.disconnect(force=True)
+                    logging.info('Music watchdog disconnected from empty channel %s', vc.channel.name)
+        except Exception as exc:
+            logging.warning('Music watchdog error: %s', type(exc).__name__)
+
+
 class RippleClient(discord.Client):
     async def setup_hook(self):
         self.monitor = asyncio.create_task(meeting_monitor_loop())
+        self.reminders = asyncio.create_task(extras.reminder_loop())
+        self.music_watchdog = asyncio.create_task(music_watchdog_loop())
 
     async def on_ready(self):
         logging.info('Discord READY; bot=%s; message_content=%s', self.user.id, self.intents.message_content)
@@ -1475,10 +1623,19 @@ class RippleClient(discord.Client):
                 except (discord.HTTPException, ValueError, TypeError):
                     logging.warning('Could not restore meeting statistics from reports channel')
 
-        # Register music slash commands for the guild
-        for cmd in MUSIC_SLASH_COMMANDS:
+        # Upsert slash commands (music + extras) for the guild without touching
+        # commands registered elsewhere (e.g. portal-created global commands).
+        commands_url = f'/applications/{self.user.id}/guilds/{GUILD_ID}/commands'
+        try:
+            existing = {c['name']: c['id'] for c in await api_call(commands_url)}
+        except Exception:
+            existing = {}
+        for cmd in MUSIC_SLASH_COMMANDS + extras.SLASH_COMMANDS:
             try:
-                await api_call(f'/applications/{self.user.id}/guilds/{GUILD_ID}/commands', method='POST', data=cmd)
+                if cmd['name'] in existing:
+                    await api_call(f"{commands_url}/{existing[cmd['name']]}", method='PATCH', data=cmd)
+                else:
+                    await api_call(commands_url, method='POST', data=cmd)
             except Exception as e:
                 logging.debug('Could not register slash command %s: %s', cmd['name'], e)
 
@@ -1504,8 +1661,18 @@ class RippleClient(discord.Client):
         finally:
             _interactions.pop(interaction.token, None)
 
+    async def on_message(self, message):
+        # Primary text-command path: the SDK message event. The raw-socket
+        # listener below is only a fallback; deduplication prevents double runs.
+        if message.author.bot:
+            return
+        if not _mark_seen(message.id):
+            return
+        await handle_message(message_payload(message))
+
     async def on_socket_raw_receive(self, message):
-        # discord.py emits decompressed JSON text for this debug event.
+        # Fallback path in case the SDK message event misses messages
+        # (discord.py emits decompressed JSON text for this debug event).
         if isinstance(message, bytes):
             message = message.decode('utf-8', errors='ignore')
         try:
@@ -1513,7 +1680,22 @@ class RippleClient(discord.Client):
         except Exception:
             return
         if payload.get('t') == 'MESSAGE_CREATE':
-            await handle_message(payload['d'])
+            d = payload['d']
+            if not _mark_seen(d.get('id')):
+                return
+            await handle_message(d)
+
+    async def on_member_join(self, member):
+        try:
+            await extras.on_member_join(member)
+        except Exception as exc:
+            logging.warning('Member join handler failed: %s', type(exc).__name__)
+
+    async def on_member_remove(self, member):
+        try:
+            await extras.on_member_remove(member)
+        except Exception as exc:
+            logging.warning('Member remove handler failed: %s', type(exc).__name__)
 
     async def on_voice_state_update(self, member, before, after):
         if str(member.guild.id) != GUILD_ID or member.bot:
@@ -1546,6 +1728,7 @@ class RippleClient(discord.Client):
 intents = discord.Intents.default()
 intents.message_content = True
 client = RippleClient(intents=intents, enable_debug_events=True, allowed_mentions=discord.AllowedMentions.none())
+extras.setup(client, api_call, GUILD_ID)
 
 
 async def run_bot():

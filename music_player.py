@@ -2,7 +2,9 @@
 import asyncio
 import json
 import logging
+import random
 import re
+import time
 import urllib.parse
 import urllib.request
 from dataclasses import dataclass
@@ -20,17 +22,24 @@ YTDL_OPTIONS = {
     'no_warnings': True,
     'default_search': 'ytsearch',
     'source_address': '0.0.0.0',
-    'extract_flat': False,
     'ignoreerrors': True,
+    'socket_timeout': 10,
     'extractor_args': {
         'youtube': {
-            'player_client': ['android', 'ios']
+            'player_client': ['android', 'ios', 'web']
         }
     }
 }
 
+# Flat search only resolves the listing (title/id/duration), which is several
+# times faster than fully extracting every candidate video.
+SEARCH_OPTIONS = {**YTDL_OPTIONS, 'extract_flat': 'discard_in_playlist'}
+
 FFMPEG_BEFORE_OPTIONS = '-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5'
 FFMPEG_OPTIONS = '-vn'
+
+STREAM_CACHE_TTL = 1800  # resolved stream URLs stay valid for hours; refresh every 30 min
+_stream_cache: dict[str, tuple[float, dict]] = {}
 
 
 @dataclass
@@ -51,108 +60,126 @@ class MusicTrack:
         return f"{minutes:02d}:{seconds:02d}"
 
 
+def _spotify_oembed(url: str) -> dict:
+    req = urllib.request.Request(
+        f"https://open.spotify.com/oembed?url={urllib.parse.quote(url)}",
+        headers={'User-Agent': 'Mozilla/5.0'})
+    with urllib.request.urlopen(req, timeout=5) as resp:
+        return json.loads(resp.read().decode('utf-8'))
+
+
+def _spotify_page_meta(url: str) -> dict:
+    req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
+    with urllib.request.urlopen(req, timeout=5) as resp:
+        html = resp.read().decode('utf-8', errors='ignore')
+    meta = {}
+    m = re.search(r'<title>(.*?)</title>', html)
+    if m:
+        raw_title = m.group(1)
+        # Format: "Track - song and lyrics by Artist | Spotify"
+        match = re.search(r'(.*?)\s*-\s*song\s*(?:and lyrics\s*)?by\s*(.*?)\s*\|\s*Spotify', raw_title, re.IGNORECASE)
+        if match:
+            meta['title'] = match.group(1).strip()
+            meta['artist'] = match.group(2).strip()
+        elif ' | Spotify' in raw_title:
+            cleaned = raw_title.replace(' | Spotify', '').strip()
+            parts = cleaned.split(' - ')
+            if len(parts) >= 2:
+                meta['title'] = parts[0].strip()
+                meta['artist'] = parts[1].strip()
+            else:
+                meta['title'] = cleaned
+    return meta
+
+
 def resolve_spotify_url(url: str) -> Optional[dict]:
-    """Resolves Spotify track title and artist using public oEmbed + page title metadata."""
+    """Resolves Spotify track title and artist using public oEmbed + page title metadata (no API keys needed)."""
     parsed = urllib.parse.urlparse(url)
     if 'spotify.com' not in parsed.netloc:
         return None
 
-    title = ""
-    artist = ""
-    thumbnail = ""
-
-    # 1. Fetch Spotify oEmbed
+    oembed, page = {}, {}
     try:
-        oembed_url = f"https://open.spotify.com/oembed?url={urllib.parse.quote(url)}"
-        req = urllib.request.Request(oembed_url, headers={'User-Agent': 'Mozilla/5.0'})
-        with urllib.request.urlopen(req, timeout=5) as resp:
-            data = json.loads(resp.read().decode('utf-8'))
-            title = data.get('title', '')
-            thumbnail = data.get('thumbnail_url', '')
+        oembed = _spotify_oembed(url)
     except Exception as e:
         logger.debug("Spotify oEmbed lookup failed: %s", e)
-
-    # 2. Fetch page title for detailed artist
     try:
-        req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
-        with urllib.request.urlopen(req, timeout=5) as resp:
-            html = resp.read().decode('utf-8', errors='ignore')
-            m = re.search(r'<title>(.*?)</title>', html)
-            if m:
-                raw_title = m.group(1)
-                # Format: "Track - song and lyrics by Artist | Spotify"
-                match = re.search(r'(.*?)\s*-\s*song\s*(?:and lyrics\s*)?by\s*(.*?)\s*\|\s*Spotify', raw_title, re.IGNORECASE)
-                if match:
-                    title = match.group(1).strip()
-                    artist = match.group(2).strip()
-                elif ' | Spotify' in raw_title:
-                    cleaned = raw_title.replace(' | Spotify', '').strip()
-                    parts = cleaned.split(' - ')
-                    if len(parts) >= 2:
-                        title = parts[0].strip()
-                        artist = parts[1].strip()
-                    else:
-                        title = cleaned
+        page = _spotify_page_meta(url)
     except Exception as e:
         logger.debug("Spotify page title lookup failed: %s", e)
 
+    title = page.get('title') or oembed.get('title', '')
     if not title:
         return None
-
-    search_query = f"{title} {artist}".strip()
     return {
         "title": title,
-        "artist": artist or "Spotify Artist",
-        "search_query": search_query,
-        "thumbnail": thumbnail,
+        "artist": page.get('artist') or "Spotify Artist",
+        "search_query": f"{title} {page.get('artist') or ''}".strip(),
+        "thumbnail": oembed.get('thumbnail_url', ''),
     }
 
 
-def search_tracks_sync(query: str, limit: int = 5) -> list[dict]:
-    """Extracts up to `limit` candidates from YouTube (android/ios client) or SoundCloud."""
-    results = []
-    with yt_dlp.YoutubeDL(YTDL_OPTIONS) as ytdl:
-        if query.startswith(('http://', 'https://')):
+def _flat_entries_sync(query: str, limit: int) -> list[dict]:
+    """Fast search: resolves the result listing without extracting every video."""
+    with yt_dlp.YoutubeDL(SEARCH_OPTIONS) as ytdl:
+        info = ytdl.extract_info(f"ytsearch{limit}:{query}", download=False)
+        entries = [e for e in ((info or {}).get('entries') or []) if e]
+        if not entries:
             try:
-                info = ytdl.extract_info(query, download=False)
-                if info:
-                    if 'entries' in info and info['entries']:
-                        return [e for e in info['entries'] if e][:limit]
-                    return [info]
-            except Exception as e:
-                logger.warning("Direct URL extraction failed: %s", e)
-
-        try:
-            target = f"ytsearch{limit}:{query}"
-            info = ytdl.extract_info(target, download=False)
-            if info and 'entries' in info:
-                for entry in info['entries']:
-                    if entry and entry.get('title'):
-                        results.append(entry)
-                        if len(results) >= limit:
-                            break
-        except Exception as e:
-            logger.warning("YouTube search failed: %s; trying SoundCloud...", e)
-
-        if len(results) < limit:
-            try:
-                sc_count = limit - len(results)
-                sc_target = f"scsearch{sc_count + 3}:{query}"
-                sc_info = ytdl.extract_info(sc_target, download=False)
-                if sc_info and 'entries' in sc_info:
-                    for entry in sc_info['entries']:
-                        if entry and entry.get('title') and entry.get('url'):
-                            results.append(entry)
-                            if len(results) >= limit:
-                                break
+                info = ytdl.extract_info(f"scsearch{limit}:{query}", download=False)
+                entries = [e for e in ((info or {}).get('entries') or []) if e and e.get('url')]
             except Exception as sc_err:
                 logger.warning("SoundCloud search failed: %s", sc_err)
+        return entries[:limit]
 
-    return results
+
+def _extract_info_sync(url: str) -> Optional[dict]:
+    """Full extraction of a single track (returns the playable info dict)."""
+    with yt_dlp.YoutubeDL(YTDL_OPTIONS) as ytdl:
+        info = ytdl.extract_info(url, download=False)
+        if info and 'entries' in info:
+            info = next((e for e in info['entries'] if e), None)
+        return info
 
 
-async def search_tracks(query: str, requester: str, limit: int = 5) -> list[MusicTrack]:
-    """Searches and returns up to `limit` candidates as MusicTrack objects."""
+def _direct_url_entries_sync(query: str, limit: int) -> list[dict]:
+    """Full extraction for direct links (needed for the stream URL right away)."""
+    with yt_dlp.YoutubeDL(YTDL_OPTIONS) as ytdl:
+        info = ytdl.extract_info(query, download=False)
+        if not info:
+            return []
+        if 'entries' in info:
+            return [e for e in info['entries'] if e][:limit]
+        return [info]
+
+
+async def get_stream_info(source_url: str) -> Optional[dict]:
+    """Resolves (and caches) the playable stream info for a track page URL."""
+    if not source_url:
+        return None
+    cached = _stream_cache.get(source_url)
+    if cached and cached[0] > time.time():
+        return cached[1]
+    try:
+        info = await asyncio.to_thread(_extract_info_sync, source_url)
+    except Exception as e:
+        logger.warning("Stream resolution failed for %s: %s", source_url, e)
+        return None
+    if not info or not info.get('url'):
+        return None
+    if len(_stream_cache) > 256:
+        for key in list(_stream_cache)[:64]:
+            _stream_cache.pop(key, None)
+    _stream_cache[source_url] = (time.time() + STREAM_CACHE_TTL, info)
+    return info
+
+
+async def search_tracks(query: str, requester: str, limit: int = 5, resolve_first: bool = True) -> list[MusicTrack]:
+    """Searches and returns up to `limit` candidates as MusicTrack objects.
+
+    Uses a fast flat listing for search queries and only fully resolves the
+    stream URL of the first track; the rest resolve lazily when played.
+    """
     query = query.strip()
     spotify_meta = None
 
@@ -161,14 +188,19 @@ async def search_tracks(query: str, requester: str, limit: int = 5) -> list[Musi
         if spotify_meta:
             query = spotify_meta['search_query']
 
-    raw_entries = await asyncio.to_thread(search_tracks_sync, query, limit)
+    is_url = query.startswith(('http://', 'https://'))
+    if is_url:
+        raw_entries = await asyncio.to_thread(_direct_url_entries_sync, query, limit)
+    else:
+        raw_entries = await asyncio.to_thread(_flat_entries_sync, query, limit)
+
     tracks = []
     for idx, info in enumerate(raw_entries):
         title = (spotify_meta['title'] if (spotify_meta and idx == 0) else info.get('title')) or 'Unknown Title'
-        artist = (spotify_meta['artist'] if (spotify_meta and idx == 0) else (info.get('artist') or info.get('uploader'))) or 'Unknown Artist'
+        artist = (spotify_meta['artist'] if (spotify_meta and idx == 0) else (info.get('artist') or info.get('uploader') or info.get('channel'))) or 'Unknown Artist'
         duration = int(info.get('duration') or 0)
         thumbnail = (spotify_meta.get('thumbnail') if (spotify_meta and idx == 0) else None) or info.get('thumbnail') or ""
-        source_url = info.get('webpage_url') or query
+        source_url = info.get('webpage_url') or info.get('url') or query
         stream_url = info.get('url') or ""
 
         tracks.append(MusicTrack(
@@ -180,13 +212,14 @@ async def search_tracks(query: str, requester: str, limit: int = 5) -> list[Musi
             thumbnail=thumbnail,
             requester=requester,
         ))
+
+    if tracks and resolve_first and not tracks[0].stream_url:
+        info = await get_stream_info(tracks[0].source_url)
+        if info:
+            tracks[0].stream_url = info.get('url') or ""
+            if tracks[0].duration <= 0 and info.get('duration'):
+                tracks[0].duration = int(info['duration'])
     return tracks
-
-
-async def resolve_track(query: str, requester: str) -> Optional[MusicTrack]:
-    """Resolves best match for query."""
-    tracks = await search_tracks(query, requester, limit=1)
-    return tracks[0] if tracks else None
 
 
 class GuildMusicQueue:
@@ -197,6 +230,7 @@ class GuildMusicQueue:
         self.now_playing: Optional[MusicTrack] = None
         self.voice_client: Optional[discord.VoiceClient] = None
         self.volume: float = 0.5
+        self.loop: bool = False
         self.lock = asyncio.Lock()
         self.source = None
 
@@ -206,10 +240,13 @@ class GuildMusicQueue:
     def is_paused(self) -> bool:
         return bool(self.voice_client and self.voice_client.is_paused())
 
-    async def enqueue(self, track: MusicTrack, vc: discord.VoiceClient, channel_to_notify=None) -> int:
+    async def enqueue(self, track: MusicTrack, vc: discord.VoiceClient, channel_to_notify=None, front: bool = False) -> int:
         async with self.lock:
             self.voice_client = vc
-            self.queue.append(track)
+            if front and self.now_playing:
+                self.queue.insert(0, track)
+            else:
+                self.queue.append(track)
             position = len(self.queue)
             if not self.is_playing() and not self.is_paused() and not self.now_playing:
                 await self._play_next(channel_to_notify)
@@ -230,11 +267,14 @@ class GuildMusicQueue:
             return
 
         try:
-            # Re-resolve stream url if expired (yt-dlp stream urls can expire after a while)
+            # Resolve the stream URL lazily (and re-resolve expired ones) so
+            # searches stay fast and cached URLs never go stale.
             if not track.stream_url:
-                refreshed = await resolve_track(track.source_url or track.title, track.requester)
-                if refreshed:
-                    track.stream_url = refreshed.stream_url
+                info = await get_stream_info(track.source_url or track.title)
+                if info:
+                    track.stream_url = info.get('url') or ""
+                    if track.duration <= 0 and info.get('duration'):
+                        track.duration = int(info['duration'])
 
             ffmpeg_audio = discord.FFmpegPCMAudio(
                 track.stream_url,
@@ -248,6 +288,8 @@ class GuildMusicQueue:
             def after_playing(err):
                 if err:
                     logger.error("Error playing track %s: %s", track.title, err)
+                if self.loop and self.now_playing is track:
+                    self.queue.insert(0, track)
                 asyncio.run_coroutine_threadsafe(self._play_next(notify_channel), loop)
 
             self.voice_client.play(self.source, after=after_playing)
@@ -295,6 +337,15 @@ class GuildMusicQueue:
             self.voice_client.stop()
         return True
 
+    def shuffle(self) -> int:
+        random.shuffle(self.queue)
+        return len(self.queue)
+
+    def remove(self, index: int) -> Optional[MusicTrack]:
+        if 1 <= index <= len(self.queue):
+            return self.queue.pop(index - 1)
+        return None
+
     def set_volume(self, volume_percent: int) -> float:
         vol = max(1, min(100, volume_percent)) / 100.0
         self.volume = vol
@@ -310,3 +361,6 @@ def get_queue(guild_id: str, client: discord.Client) -> GuildMusicQueue:
     if guild_id not in _guild_queues:
         _guild_queues[guild_id] = GuildMusicQueue(guild_id, client)
     return _guild_queues[guild_id]
+
+def all_queues() -> list[GuildMusicQueue]:
+    return list(_guild_queues.values())
