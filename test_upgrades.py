@@ -250,5 +250,58 @@ class MusicSpeedTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(queue.remove(9))
 
 
+class MusicGuardTests(unittest.IsolatedAsyncioTestCase):
+    """Debounce, hard timeout, and fast not-in-voice fallback for play/search."""
+
+    async def test_play_without_voice_fails_fast_before_search(self):
+        guild = SimpleNamespace(id='99', get_member=Mock(return_value=SimpleNamespace(voice=None)))
+        with patch.object(bot.client, 'get_guild', return_value=guild), \
+             patch.object(bot.client, 'get_channel', return_value=None), \
+             patch.object(bot.client, 'fetch_channel', AsyncMock(return_value=None)), \
+             patch.object(bot, 'recorder', None), \
+             patch.object(bot.discord.utils, 'get', return_value=None), \
+             patch.object(bot.music_player, 'search_tracks', AsyncMock()) as search:
+            result = await bot.execute_music_command('play', 'yeat', '1', 'Alt', '2')
+        search.assert_not_awaited()
+        self.assertIn('voice channel', result['content'])
+
+    async def test_music_debounce_rejects_second_concurrent_request(self):
+        started, release = asyncio.Event(), asyncio.Event()
+
+        async def slow(*args, **kwargs):
+            started.set()
+            await release.wait()
+            return {'content': 'done'}
+
+        with patch.object(bot, 'execute_music_command', slow):
+            first = asyncio.create_task(bot.execute_music_command_guarded('play', 'x', 'user1', 'A', '2'))
+            await asyncio.wait_for(started.wait(), 1)
+            second = await bot.execute_music_command_guarded('play', 'y', 'user1', 'A', '2')
+            self.assertIn('one at a time', second['content'])
+            # A different user is not blocked by user1's in-flight search.
+            self.assertNotIn('user2', bot._music_busy)
+            release.set()
+            self.assertEqual((await first)['content'], 'done')
+        self.assertNotIn('user1', bot._music_busy)
+
+    async def test_music_search_timeout_returns_reply(self):
+        async def slow(*args, **kwargs):
+            await asyncio.sleep(5)
+            return {'content': 'done'}
+
+        with patch.object(bot, 'MUSIC_SEARCH_TIMEOUT', 0.1), patch.object(bot, 'execute_music_command', slow):
+            result = await asyncio.wait_for(bot.execute_music_command_guarded('play', 'x', 'u', 'A', '2'), 3)
+        self.assertIn('timed out', result['content'])
+
+    async def test_non_search_music_commands_skip_debounce(self):
+        async def instant(*args, **kwargs):
+            return {'content': 'ok'}
+
+        with patch.object(bot, 'execute_music_command', instant):
+            result = await bot.execute_music_command_guarded('skip', '', 'u', 'A', '2')
+        self.assertEqual(result['content'], 'ok')
+        self.assertNotIn('u', bot._music_busy)
+
+
 if __name__ == '__main__':
     unittest.main()

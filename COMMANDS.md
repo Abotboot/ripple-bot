@@ -143,4 +143,6 @@ Voice messages sent during a meeting are transcribed automatically.
 - **Welcome / goodbye messages** and **auto-role**
 - **Rate limiting** on AI commands (per-user sliding window + global protection)
 - **Fast music** — flat yt-dlp search with lazy stream resolution and a 30-min track cache
+- **Music guards** — one search at a time per user (instant "one at a time!" reply instead of stacking),
+  instant not-in-voice fallback, and a 45s hard timeout so `/play` can never sit on "thinking…" forever
 - **Music watchdog** — auto-recovers playback if a stream stalls

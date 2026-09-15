@@ -331,6 +331,41 @@ MUSIC_SLASH_COMMANDS = [
 
 recent_searches: dict[str, list[music_player.MusicTrack]] = {}
 
+# In-flight play/search requests, per user (debounce so repeated requests
+# don't stack up parallel yt-dlp searches).
+_music_busy: set[str] = set()
+MUSIC_SEARCH_TIMEOUT = 45  # seconds; a song search should never take longer
+# (yt-dlp's socket_timeout only caps individual socket reads, not a whole
+# stalled extraction - this wait_for is what actually bounds /play)
+
+
+async def execute_music_command_guarded(command: str, query: str, author_id: str, author_name: str, channel_id: str) -> dict:
+    """Runs a music command with debouncing and a hard timeout.
+
+    - One in-flight search per user: hammering !play gets an instant reply
+      instead of silently stacking yt-dlp searches.
+    - Bounded wait: a hung search can no longer leave a /play interaction
+      stuck on "Ripple Bot is thinking..." forever.
+    """
+    searchable = command in ('play', 'playtop', 'search', 'find')
+    if searchable:
+        if author_id in _music_busy:
+            return {'content': '⏳ Still grabbing your last song — one at a time!'}
+        _music_busy.add(author_id)
+    try:
+        if searchable:
+            return await asyncio.wait_for(
+                execute_music_command(command, query, author_id, author_name, channel_id),
+                timeout=MUSIC_SEARCH_TIMEOUT,
+            )
+        return await execute_music_command(command, query, author_id, author_name, channel_id)
+    except asyncio.TimeoutError:
+        logging.warning('Music command %r timed out after %ss', command, MUSIC_SEARCH_TIMEOUT)
+        return {'content': '⏱️ The song search timed out. Try again, or paste a direct YouTube/SoundCloud link.'}
+    finally:
+        if searchable:
+            _music_busy.discard(author_id)
+
 
 class MusicSelectionView(discord.ui.View):
     def __init__(self, track_count: int, timeout: float = 300):
@@ -433,12 +468,23 @@ async def execute_music_command(command: str, query: str, author_id: str, author
         if not query:
             return {'content': '⚠️ Please provide a song name or Spotify/YouTube/SoundCloud URL.\nExample: `!play lofi beats` or `/play <spotify-url>`'}
 
-        # Quick pick from recent search if query is digit 1-5
+        # Quick pick from recent search if query is digit 1-5 (instant; the
+        # voice check inside play_resolved_track still applies)
         if query.isdigit() and 1 <= int(query) <= 5:
             cached = recent_searches.get(f"{channel_id}:{author_id}") or recent_searches.get(channel_id)
             if cached and int(query) <= len(cached):
                 track = cached[int(query) - 1]
                 return await play_resolved_track(track, author_id, author_name, channel_id, guild, front=(command == 'playtop'))
+
+        # Fast fallback: check voice BEFORE searching, so someone who is not
+        # in a voice channel gets an instant error instead of waiting on a
+        # song search that can never play.
+        member = guild.get_member(int(author_id)) if guild and author_id else None
+        user_vc = getattr(member.voice, 'channel', None) if (member and getattr(member, 'voice', None)) else None
+        bot_vc = (recorder.vc if recorder and getattr(recorder, 'vc', None) and recorder.vc.is_connected() else None) \
+            or discord.utils.get(client.voice_clients, guild=guild)
+        if not user_vc and not (bot_vc and bot_vc.is_connected()):
+            return {'content': '⚠️ Join a voice channel first, then run `/play` again — I play wherever you are!'}
 
         tracks = await music_player.search_tracks(query, author_name, limit=5)
         if not tracks:
@@ -889,7 +935,7 @@ async def handle_interaction(d):
             await interaction_callback(i_id, i_token, {'type': 5})
             options = {opt['name']: opt['value'] for opt in data.get('options', [])}
             query = options.get('query') or options.get('percent') or options.get('channel') or options.get('position') or ''
-            result = await execute_music_command(cname, str(query), user_id, user_name, channel_id)
+            result = await execute_music_command_guarded(cname, str(query), user_id, user_name, channel_id)
             await interaction_edit_original(i_token, result)
             return
 
@@ -1061,7 +1107,11 @@ async def handle_message(d):
             elif cmd in ('summon',): cmd = 'join'
             elif cmd in ('dc', 'disconnect'): cmd = 'leave'
             q_arg = m_music.group(3) or ''
-            result = await execute_music_command(cmd, q_arg, author_id, author_name, channel_id)
+            try:
+                result = await execute_music_command_guarded(cmd, q_arg, author_id, author_name, channel_id)
+            except Exception as e:
+                logging.error('Music text command %r failed: %s', cmd, e)
+                result = {'content': '⚠️ Something went wrong with that music command. Try again in a moment.'}
             await api_call(f'/channels/{channel_id}/messages', method='POST', data={**result, 'message_reference': {'message_id': msg_id}})
             return
 
