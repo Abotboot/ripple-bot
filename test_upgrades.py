@@ -180,6 +180,25 @@ class MessagePathTests(unittest.IsolatedAsyncioTestCase):
             handler.assert_not_awaited()
 
 
+class SsrfTests(unittest.IsolatedAsyncioTestCase):
+    def test_private_media_urls_rejected_before_network(self):
+        for url in ('http://127.0.0.1/x.mp3', 'http://169.254.169.254/latest/meta-data',
+                    'http://localhost:8080/', 'http://10.0.0.5/a', 'http://192.168.1.1/a',
+                    'file:///etc/passwd', 'ftp://example.com/a'):
+            with self.assertRaises(ValueError):
+                music_player.assert_public_http_url(url)
+
+    def test_public_media_urls_accepted(self):
+        self.assertIsNone(music_player.assert_public_http_url('https://www.youtube.com/watch?v=dQw4w9WgXcQ'))
+        self.assertIsNone(music_player.assert_public_http_url('https://open.spotify.com/track/abc'))
+
+    def test_spotify_host_suffix_bypass_rejected(self):
+        self.assertIsNone(music_player.resolve_spotify_url('https://open.spotify.com/track/abc'))
+        # Substring-match bypass (open.spotify.com.evil.com) must not resolve
+        self.assertIsNone(music_player.resolve_spotify_url('https://open.spotify.com.evil.com/track/abc'))
+        self.assertIsNone(music_player.resolve_spotify_url('https://evil.com/open.spotify.com'))
+
+
 class MusicSpeedTests(unittest.IsolatedAsyncioTestCase):
     async def test_search_uses_flat_listing_and_resolves_only_first(self):
         flat = [

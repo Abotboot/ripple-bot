@@ -28,6 +28,11 @@ def check_rate_limit(user_id: str) -> tuple[bool, str]:
         wait = max(1, int(USER_WINDOW - (now - u_history[0])))
         return False, f"⏳ Whoa slow down, you are sending requests too fast! Cooldown: **{wait}s**."
 
+
+    # Prune stale per-user buckets so the dict cannot grow forever
+    if len(user_requests) > 1000:
+        for uid in [u for u, h in user_requests.items() if not h]:
+            user_requests.pop(uid, None)
     u_history.append(now)
     global_requests.append(now)
     return True, ""

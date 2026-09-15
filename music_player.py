@@ -1,9 +1,11 @@
 """High-performance Discord music player with Spotify resolution and yt-dlp streaming."""
 import asyncio
+import ipaddress
 import json
 import logging
 import random
 import re
+import socket
 import time
 import urllib.parse
 import urllib.request
@@ -40,6 +42,30 @@ FFMPEG_OPTIONS = '-vn'
 
 STREAM_CACHE_TTL = 1800  # resolved stream URLs stay valid for hours; refresh every 30 min
 _stream_cache: dict[str, tuple[float, dict]] = {}
+
+
+def assert_public_http_url(url: str) -> str:
+    """SSRF guard: only public http(s) URLs may be fetched by yt-dlp/FFmpeg.
+
+    Resolves every hostname to an IP and rejects private, loopback, and
+    link-local targets so a crafted !play URL cannot make the (cloud-hosted)
+    bot probe internal services. Residual risk: a public host that later
+    redirects to a private IP cannot be caught by DNS checks alone.
+    """
+    parsed = urllib.parse.urlparse(url)
+    if parsed.scheme not in ('http', 'https'):
+        raise ValueError('Only http(s) media URLs are supported')
+    host = parsed.hostname
+    if not host:
+        raise ValueError('Invalid media URL')
+    try:
+        infos = socket.getaddrinfo(host, None)
+    except OSError as exc:
+        raise ValueError(f'Could not resolve media host: {host}') from exc
+    for info in infos:
+        ip = ipaddress.ip_address(info[4][0])
+        if not ip.is_global:
+            raise ValueError('Media host resolves to a private address')
 
 
 @dataclass
@@ -95,7 +121,11 @@ def _spotify_page_meta(url: str) -> dict:
 def resolve_spotify_url(url: str) -> Optional[dict]:
     """Resolves Spotify track title and artist using public oEmbed + page title metadata (no API keys needed)."""
     parsed = urllib.parse.urlparse(url)
-    if 'spotify.com' not in parsed.netloc:
+    if parsed.scheme not in ('http', 'https') or not parsed.netloc:
+        return None
+    host = parsed.netloc.lower()
+    # Strict host check (a bare substring match would accept open.spotify.com.evil.com)
+    if host != 'open.spotify.com' and not host.endswith('.open.spotify.com'):
         return None
 
     oembed, page = {}, {}
@@ -135,6 +165,7 @@ def _flat_entries_sync(query: str, limit: int) -> list[dict]:
 
 def _extract_info_sync(url: str) -> Optional[dict]:
     """Full extraction of a single track (returns the playable info dict)."""
+    assert_public_http_url(url)
     with yt_dlp.YoutubeDL(YTDL_OPTIONS) as ytdl:
         info = ytdl.extract_info(url, download=False)
         if info and 'entries' in info:
@@ -144,6 +175,7 @@ def _extract_info_sync(url: str) -> Optional[dict]:
 
 def _direct_url_entries_sync(query: str, limit: int) -> list[dict]:
     """Full extraction for direct links (needed for the stream URL right away)."""
+    assert_public_http_url(query)
     with yt_dlp.YoutubeDL(YTDL_OPTIONS) as ytdl:
         info = ytdl.extract_info(query, download=False)
         if not info:
