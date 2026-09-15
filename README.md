@@ -14,6 +14,8 @@ pinned: false
 
 24/7 Discord AI assistant, meeting recorder, and music player — runs free on Hugging Face Spaces.
 
+📄 **Full command reference: [COMMANDS.md](COMMANDS.md)**
+
 ## What RippleBot does
 
 **AI** — Groq-powered chat (`@RippleBot <question>` or `/ask`), vision (attach an image and mention the bot),
