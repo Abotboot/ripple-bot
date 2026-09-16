@@ -316,6 +316,38 @@ class ChatMemoryTests(unittest.TestCase):
         chat_memory.record('c1', '1', 'Alt', '<@1546333781764345936>')
         self.assertEqual(chat_memory.build_history('c1'), [])
 
+    def test_backfill_reads_messages_above_newest_first(self):
+        past = [
+            {'id': '30', 'author': {'id': 'u3', 'username': 'Tobalaka'}, 'content': '<@1546333781764345936> tell him'},
+            {'id': '29', 'author': {'id': 'u2', 'username': 'Alt'}, 'content': 'and thats ripple bot'},
+            {'id': '28', 'author': {'id': 'u2', 'username': 'Alt'}, 'content': 'only one coder bro'},
+            {'id': '27', 'author': {'id': 'u1', 'username': 'Someone'}, 'content': '!play yeat'},
+            {'id': '26', 'author': {'id': 'u9', 'username': 'OtherBot', 'bot': True}, 'content': 'other bot noise'},
+            {'id': '25', 'author': {'id': '1546333781764345936', 'username': 'Ripple Bot'}, 'content': 'earlier bot reply'},
+        ]
+        chat_memory.backfill('c1', past, bot_id='1546333781764345936')
+        history = chat_memory.build_history('c1', exclude_message_id='30')
+        contents = [m['content'] for m in history]
+        self.assertEqual(contents, [
+            'earlier bot reply',
+            'Alt: only one coder bro',
+            'Alt: and thats ripple bot',
+        ])
+        self.assertEqual(history[0]['role'], 'assistant')
+        self.assertEqual(history[1]['role'], 'user')
+
+    def test_backfill_dedupes_against_live_capture(self):
+        chat_memory.record('c1', '28', 'Alt', 'only one coder bro')
+        past = [{'id': '28', 'author': {'id': 'u2', 'username': 'Alt'}, 'content': 'only one coder bro'}]
+        chat_memory.backfill('c1', past, bot_id='bot')
+        self.assertEqual(chat_memory.message_count('c1'), 1)
+
+    def test_message_count(self):
+        self.assertEqual(chat_memory.message_count('nope'), 0)
+        chat_memory.record('c1', '1', 'Alt', 'hey')
+        chat_memory.record('c1', '2', 'Alt', 'hey again')
+        self.assertEqual(chat_memory.message_count('c1'), 2)
+
     def test_groq_water_chat_passes_history_to_model(self):
         history = [{'role': 'user', 'content': 'Alt: who taught this model'}]
         captured = {}

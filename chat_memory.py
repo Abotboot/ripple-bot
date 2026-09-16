@@ -42,13 +42,48 @@ def record(channel_id, message_id, name, content, is_bot=False):
     if not text:
         return
     buf = _channels[str(channel_id)]
-    buf.append((time.time(), str(message_id or ''), name or 'User', text, bool(is_bot)))
+    mid = str(message_id or '')
+    # Skip messages we already stored (backfill vs live capture overlap).
+    if mid and any(existing[1] == mid for existing in buf):
+        return
+    buf.append((time.time(), mid, name or 'User', text, bool(is_bot)))
     # Trim by count and by age.
     while len(buf) > MAX_MESSAGES:
         buf.popleft()
     cutoff = time.time() - MAX_AGE_SECONDS
     while buf and buf[0][0] < cutoff:
         buf.popleft()
+
+
+def message_count(channel_id):
+    """How many remembered messages a channel currently has (after expiry)."""
+    buf = _channels.get(str(channel_id))
+    if not buf:
+        return 0
+    cutoff = time.time() - MAX_AGE_SECONDS
+    while buf and buf[0][0] < cutoff:
+        buf.popleft()
+    return len(buf)
+
+
+def backfill(channel_id, messages, bot_id=''):
+    """
+    Seed memory from fetched channel history (Discord returns newest first)
+    so context survives restarts: on the first mention the bot reads the
+    messages above it. Skips other bots and command-style messages.
+    """
+    for m in reversed(messages or []):
+        author = m.get('author', {})
+        content = (m.get('content') or '').strip()
+        author_id = author.get('id', '')
+        is_own = author_id == str(bot_id or '')
+        if author.get('bot') and not is_own:
+            continue
+        if not is_own and content.startswith(('!', '?', '/')):
+            continue
+        record(channel_id, m.get('id'),
+               author.get('global_name') or author.get('username') or 'User',
+               content, is_bot=is_own)
 
 
 def build_history(channel_id, exclude_message_id=None, limit=HISTORY_LIMIT):

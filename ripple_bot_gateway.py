@@ -1446,6 +1446,15 @@ async def handle_message(d):
                 transcript = "\n".join(chat_lines[-12:]) if chat_lines else "No recent messages."
                 answer = await loop.run_in_executor(None, groq_engine.groq_summarize_chat, transcript, user_display)
             else:
+                # Memory is thin (fresh restart or quiet channel): read the
+                # messages above us so the conversation has context anyway.
+                if chat_memory.message_count(channel_id) < 5:
+                    try:
+                        past = await api_call(f'/channels/{channel_id}/messages?limit=25')
+                        if isinstance(past, list):
+                            chat_memory.backfill(channel_id, past, bot_id=BOT_ID)
+                    except Exception as e:
+                        print(f"Chat memory backfill error: {e}")
                 history = chat_memory.build_history(channel_id, exclude_message_id=msg_id)
                 answer = await loop.run_in_executor(None, groq_engine.groq_water_chat, cleaned_prompt, user_display, history)
 
