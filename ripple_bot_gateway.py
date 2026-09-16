@@ -35,6 +35,7 @@ import image_gen
 import meeting_tracker
 import music_player
 import extras
+import role_setup
 
 if sys.platform == 'win32':
     sys.stdout.reconfigure(encoding='utf-8')
@@ -913,7 +914,14 @@ async def handle_interaction(d):
             await interaction_edit_original(i_token, result)
             return
 
-        # 9. Extras slash commands: moderation, leveling, reminders, fun, info
+        # 9. /setup-roles: one-shot team role setup, guild owner only
+        if cname == 'setup-roles':
+            await interaction_callback(i_id, i_token, {'type': 5, 'data': {'flags': 64}})
+            report = await role_setup.setup_roles(api_call, GUILD_ID, requester_id=str(user_id))
+            await interaction_edit_original(i_token, {'content': report})
+            return
+
+        # 10. Extras slash commands: moderation, leveling, reminders, fun, info
         if cname in {c['name'] for c in extras.SLASH_COMMANDS}:
             await interaction_callback(i_id, i_token, {'type': 5})
             raw_options = data.get('options', [])
@@ -1680,7 +1688,7 @@ class RippleClient(discord.Client):
             existing = {c['name']: c['id'] for c in await api_call(commands_url)}
         except Exception:
             existing = {}
-        for cmd in MUSIC_SLASH_COMMANDS + extras.SLASH_COMMANDS:
+        for cmd in MUSIC_SLASH_COMMANDS + extras.SLASH_COMMANDS + role_setup.SLASH_COMMANDS:
             try:
                 if cmd['name'] in existing:
                     await api_call(f"{commands_url}/{existing[cmd['name']]}", method='PATCH', data=cmd)
