@@ -1690,6 +1690,7 @@ class RippleClient(discord.Client):
         self.monitor = asyncio.create_task(meeting_monitor_loop())
         self.reminders = asyncio.create_task(extras.reminder_loop())
         self.music_watchdog = asyncio.create_task(music_watchdog_loop())
+        self.extras_backup = asyncio.create_task(extras.backup_loop())
 
     async def on_ready(self):
         logging.info('Discord READY; bot=%s; message_content=%s', self.user.id, self.intents.message_content)

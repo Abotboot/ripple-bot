@@ -14,6 +14,7 @@ import discord
 import meeting_tracker
 import groq_engine
 import chat_memory
+import extras
 import ripple_bot_gateway as bot
 from voice_capture import MeetingRecorder
 import music_player
@@ -362,6 +363,126 @@ class ChatMemoryTests(unittest.TestCase):
         self.assertIn('CONVERSATION MEMORY', msgs[0]['content'])
         self.assertEqual(msgs[1], history[0])
         self.assertEqual(msgs[-1]['content'], 'Tobalaka: w opinion')
+
+
+class ExtrasBackupTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        extras._data = json.loads(json.dumps(extras.DEFAULT_DATA))
+        extras._dirty = False
+        extras._last_backup_message_id = None
+        DATA_FILE = extras.DATA_FILE
+        if os.path.exists(DATA_FILE):
+            os.remove(DATA_FILE)
+
+    def tearDown(self):
+        if os.path.exists(extras.DATA_FILE):
+            os.remove(extras.DATA_FILE)
+
+    async def test_backup_roundtrip_restores_xp(self):
+        extras._data['xp']['42'] = {'xp': 250, 'name': 'Alt'}
+        extras._data['warnings']['42'] = [{'reason': 'spam', 'mod': 'Abod', 'ts': 1}]
+        extras._save()
+        self.assertTrue(extras._dirty)
+
+        sent_files = []
+        class FakeAttachment:
+            filename = extras.BACKUP_FILENAME
+            def __init__(self, data):
+                self._data = data
+            async def read(self):
+                return self._data
+        class FakeMessage:
+            def __init__(self, data, mid):
+                self.attachments = [FakeAttachment(data)]
+                self.author = SimpleNamespace(id=999)
+                self.id = mid
+        class FakeChannel:
+            def __init__(self):
+                self.backup_messages = []
+            async def send(self, content=None, file=None, allowed_mentions=None):
+                sent_files.append(file.fp.getvalue())
+                self.backup_messages.append(FakeMessage(file.fp.getvalue(), 1001 + len(self.backup_messages)))
+                return SimpleNamespace(id=self.backup_messages[-1].id)
+            def history(self, limit=100):
+                async def gen():
+                    for msg in reversed(self.backup_messages):
+                        yield msg
+                return gen()
+            def get_partial_message(self, mid):
+                return SimpleNamespace(delete=AsyncMock())
+        fake_channel = FakeChannel()
+        fake_client = SimpleNamespace(get_channel=lambda cid: fake_channel,
+                                      fetch_channel=AsyncMock(),
+                                      user=SimpleNamespace(id=999))
+        old_client = extras.client
+        extras.client = fake_client
+        try:
+            ok = await extras.backup_to_channel(extras.BACKUP_CHANNEL_ID)
+            self.assertTrue(ok)
+            self.assertFalse(extras._dirty)
+            self.assertTrue(sent_files)
+            stored = json.loads(sent_files[0])
+            self.assertEqual(stored['xp']['42'], {'xp': 250, 'name': 'Alt'})
+
+            # Simulate a fresh container: wipe state, restore from snapshot.
+            extras._data = json.loads(json.dumps(extras.DEFAULT_DATA))
+            extras._last_backup_message_id = None
+            restored = await extras.restore_from_channel(extras.BACKUP_CHANNEL_ID)
+            self.assertTrue(restored)
+            self.assertEqual(extras._data['xp']['42'], {'xp': 250, 'name': 'Alt'})
+            self.assertEqual(extras._data['warnings']['42'][0]['reason'], 'spam')
+            self.assertEqual(extras._data['automod']['block_invites'], True)
+        finally:
+            extras.client = old_client
+
+    async def test_restore_returns_false_when_no_backup(self):
+        class EmptyChannel:
+            def get_channel(self, cid):
+                return self
+            def history(self, limit=100):
+                async def gen():
+                    return
+                    yield
+                return gen()
+        old_client = extras.client
+        extras.client = SimpleNamespace(get_channel=lambda cid: EmptyChannel(), user=SimpleNamespace(id=999))
+        try:
+            self.assertFalse(await extras.restore_from_channel('1'))
+        finally:
+            extras.client = old_client
+
+    async def test_second_backup_replaces_snapshot(self):
+        extras._data['xp']['1'] = {'xp': 10, 'name': 'A'}
+        extras._save()
+        deleted = []
+        class FakeAttachment:
+            filename = extras.BACKUP_FILENAME
+            async def read(self):
+                return b'{}'
+        class FakePartial:
+            def __init__(self, mid):
+                self.mid = mid
+            async def delete(self):
+                deleted.append(self.mid)
+        class FakeChannel:
+            def __init__(self):
+                self.counter = 1000
+            def get_channel(self, cid):
+                return self
+            async def send(self, content=None, file=None, allowed_mentions=None):
+                self.counter += 1
+                return SimpleNamespace(id=self.counter)
+            def get_partial_message(self, mid):
+                return FakePartial(mid)
+        fake_channel = FakeChannel()
+        old_client = extras.client
+        extras.client = SimpleNamespace(get_channel=lambda cid: fake_channel, user=SimpleNamespace(id=999))
+        try:
+            self.assertTrue(await extras.backup_to_channel(extras.BACKUP_CHANNEL_ID))
+            self.assertTrue(await extras.backup_to_channel(extras.BACKUP_CHANNEL_ID))
+            self.assertEqual(deleted, [1001])
+        finally:
+            extras.client = old_client
 
 
 if __name__ == '__main__':

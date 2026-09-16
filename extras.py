@@ -11,6 +11,7 @@ Everything is persisted to extras_data.json next to this file. All commands are
 exposed both as slash commands and ! prefix commands.
 """
 import asyncio
+import io
 import json
 import logging
 import os
@@ -18,10 +19,12 @@ import random
 import re
 import time
 from collections import defaultdict, deque
+from contextlib import closing
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 import discord
+import meeting_tracker
 
 logger = logging.getLogger('extras')
 
@@ -29,6 +32,11 @@ client = None
 api = None
 GUILD_ID = '0'
 DATA_FILE = os.path.join(os.path.dirname(__file__), 'extras_data.json')
+
+# State snapshots are posted to the same private channel that keeps meeting
+# stats, so XP/levels survive Space rebuilds and restarts.
+BACKUP_CHANNEL_ID = meeting_tracker.REPORTS_CHANNEL_ID
+BACKUP_FILENAME = 'extras_data.json'
 
 # ---------------------------------------------------------------------------
 # Persistence
@@ -68,7 +76,7 @@ def _load():
         logger.warning('Could not load extras data: %s', type(exc).__name__)
 
 
-def _save():
+def _write_local():
     tmp = DATA_FILE + '.tmp'
     try:
         with open(tmp, 'w', encoding='utf-8') as f:
@@ -76,6 +84,92 @@ def _save():
         os.replace(tmp, DATA_FILE)
     except Exception as exc:
         logger.warning('Could not save extras data: %s', type(exc).__name__)
+
+
+_dirty = False
+_last_backup_message_id: Optional[str] = None
+
+
+def _save():
+    global _dirty
+    _write_local()
+    _dirty = True
+
+
+def _merge_stored(stored: dict) -> None:
+    """Merge a stored snapshot into _data (same rules as _load)."""
+    for key, value in stored.items():
+        if key == 'automod' and isinstance(value, dict):
+            _data['automod'].update(value)
+        else:
+            _data[key] = value
+
+
+async def restore_from_channel(channel_id) -> bool:
+    """Restore state from the newest extras_data.json snapshot in the backup channel."""
+    global _last_backup_message_id
+    try:
+        channel = client.get_channel(int(channel_id))
+        if channel is None:
+            channel = await client.fetch_channel(int(channel_id))
+    except (discord.HTTPException, ValueError):
+        logger.warning('Backup channel %s not found', channel_id)
+        return False
+    try:
+        async for message in channel.history(limit=100):
+            if message.author.id != client.user.id:
+                continue
+            attachment = next((a for a in message.attachments if a.filename == BACKUP_FILENAME), None)
+            if attachment is None:
+                continue
+            stored = json.loads(await attachment.read())
+            if not isinstance(stored, dict) or not isinstance(stored.get('xp'), dict):
+                continue
+            _merge_stored(stored)
+            _write_local()
+            _last_backup_message_id = str(message.id)
+            logger.info('Restored extras data from cloud snapshot (%d XP users)', len(_data['xp']))
+            return True
+    except (discord.HTTPException, ValueError, TypeError) as exc:
+        logger.warning('Could not restore extras data: %s', type(exc).__name__)
+    return False
+
+
+async def backup_to_channel(channel_id) -> bool:
+    """Post the current state snapshot to the backup channel (keeps only the newest)."""
+    global _dirty, _last_backup_message_id
+    channel = client.get_channel(int(channel_id))
+    if channel is None:
+        return False
+    _write_local()
+    try:
+        with closing(discord.File(io.BytesIO(json.dumps(_data).encode('utf-8')), filename=BACKUP_FILENAME)) as upload:
+            msg = await channel.send(content='💾 State snapshot (XP, warnings, automod, reminders)',
+                                     file=upload, allowed_mentions=discord.AllowedMentions.none())
+    except discord.HTTPException as exc:
+        logger.warning('Extras snapshot upload failed: %s', type(exc).__name__)
+        return False
+    if _last_backup_message_id:
+        try:
+            await channel.get_partial_message(int(_last_backup_message_id)).delete()
+        except (discord.HTTPException, ValueError):
+            pass
+    _last_backup_message_id = str(msg.id)
+    _dirty = False
+    return True
+
+
+async def backup_loop():
+    """Restore on boot, then refresh the snapshot whenever data changed."""
+    await client.wait_until_ready()
+    await restore_from_channel(BACKUP_CHANNEL_ID)
+    while True:
+        await asyncio.sleep(300)
+        try:
+            if _dirty:
+                await backup_to_channel(BACKUP_CHANNEL_ID)
+        except Exception as exc:
+            logger.warning('Extras backup loop error: %s', type(exc).__name__)
 
 
 def setup(client_, api_call_, guild_id_):
