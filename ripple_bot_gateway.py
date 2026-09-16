@@ -36,6 +36,7 @@ import meeting_tracker
 import music_player
 import extras
 import role_setup
+import chat_memory
 
 if sys.platform == 'win32':
     sys.stdout.reconfigure(encoding='utf-8')
@@ -891,7 +892,14 @@ async def handle_interaction(d):
             question = options.get('question', '').strip()
 
             loop = asyncio.get_event_loop()
-            answer = await loop.run_in_executor(None, groq_engine.groq_water_chat, question, user_name)
+            history = chat_memory.build_history(channel_id)
+            answer = await loop.run_in_executor(None, groq_engine.groq_water_chat, question, user_name, history)
+
+            try:
+                chat_memory.record(channel_id, i_id, user_name, question)
+                chat_memory.record(channel_id, f"{i_id}-bot", 'RippleBot', answer, is_bot=True)
+            except Exception:
+                pass
 
             chunks = split_discord_chunks(answer, max_len=1900)
             if chunks:
@@ -1049,6 +1057,13 @@ async def handle_message(d):
                     'allowed_mentions': {'parse': ['users']},
                     'message_reference': {'message_id': msg_id},
                 })
+            except Exception:
+                pass
+
+        # Conversation memory: capture casual chat so @mentions build on context.
+        if not content.startswith(('!', '?', '/')):
+            try:
+                chat_memory.record(channel_id, msg_id, author_name, content)
             except Exception:
                 pass
 
@@ -1431,10 +1446,17 @@ async def handle_message(d):
                 transcript = "\n".join(chat_lines[-12:]) if chat_lines else "No recent messages."
                 answer = await loop.run_in_executor(None, groq_engine.groq_summarize_chat, transcript, user_display)
             else:
-                answer = await loop.run_in_executor(None, groq_engine.groq_water_chat, cleaned_prompt, user_display)
+                history = chat_memory.build_history(channel_id, exclude_message_id=msg_id)
+                answer = await loop.run_in_executor(None, groq_engine.groq_water_chat, cleaned_prompt, user_display, history)
 
             if not answer:
                 answer = "Hit a quick hiccup. Try asking again!"
+
+            # Remember our own reply so follow-ups continue the conversation.
+            try:
+                chat_memory.record(channel_id, f"{msg_id}-bot", 'RippleBot', answer, is_bot=True)
+            except Exception:
+                pass
 
             await send_discord_reply(channel_id, answer, reply_to_id=msg_id)
             return

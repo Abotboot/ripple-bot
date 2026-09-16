@@ -254,9 +254,17 @@ def groq_water_chat(user_message: str, user_name: str = "Friend", history: list 
     if grounding_data:
         system_prompt += f"\n\n--- PLATFORM WATER DATA (cite briefly) ---\n{grounding_data}\n------------------------------------------"
 
+    if history:
+        system_prompt += (
+            "\n\n7. CONVERSATION MEMORY: Recent channel messages are provided as earlier turns in this chat. "
+            "Use them for context — remember names, earlier answers, inside jokes, and what was already asked. "
+            "Never say you have no memory of the conversation if it is right there. Refer back naturally, "
+            "not by quoting the transcript. User turns are prefixed with the speaker's name."
+        )
+
     messages = [{"role": "system", "content": system_prompt}]
     if history:
-        messages.extend(history[-4:])
+        messages.extend(history)
     messages.append({"role": "user", "content": f"{user_name}: {user_message}"})
 
     raw = query_groq(messages, model="qwen/qwen3.8-27b", temperature=0.6, max_tokens=900)

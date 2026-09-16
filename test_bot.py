@@ -13,6 +13,7 @@ from unittest.mock import AsyncMock, Mock, patch
 import discord
 import meeting_tracker
 import groq_engine
+import chat_memory
 import ripple_bot_gateway as bot
 from voice_capture import MeetingRecorder
 import music_player
@@ -255,6 +256,80 @@ class AsyncTests(unittest.IsolatedAsyncioTestCase):
                 fake_vc.send.assert_not_called()
         finally:
             bot.recorder = old_rec
+
+
+class ChatMemoryTests(unittest.TestCase):
+    def setUp(self):
+        chat_memory.clear()
+
+    def tearDown(self):
+        chat_memory.clear()
+
+    def test_history_roles_and_attribution(self):
+        chat_memory.record('c1', '1', 'Alt', 'only one coder bro')
+        chat_memory.record('c1', '1-bot', 'RippleBot', 'lol who you talking to', is_bot=True)
+        chat_memory.record('c1', '2', 'Tobalaka', 'wait he works like meta')
+        history = chat_memory.build_history('c1')
+        self.assertEqual(len(history), 3)
+        self.assertEqual(history[0]['role'], 'user')
+        self.assertEqual(history[0]['content'], 'Alt: only one coder bro')
+        self.assertEqual(history[1]['role'], 'assistant')
+        self.assertEqual(history[1]['content'], 'lol who you talking to')
+        self.assertEqual(history[2]['content'], 'Tobalaka: wait he works like meta')
+
+    def test_mention_tags_are_stripped(self):
+        chat_memory.record('c1', '1', 'Alt', '<@1546333781764345936> rudeus or subaru?')
+        history = chat_memory.build_history('c1')
+        self.assertEqual(history[0]['content'], 'Alt: rudeus or subaru?')
+
+    def test_exclude_message_id_skips_trigger(self):
+        chat_memory.record('c1', '10', 'Alt', 'first')
+        chat_memory.record('c1', '11', 'Alt', '@RippleBot tell him')
+        history = chat_memory.build_history('c1', exclude_message_id='11')
+        self.assertEqual(len(history), 1)
+        self.assertEqual(history[0]['content'], 'Alt: first')
+
+    def test_channels_are_isolated(self):
+        chat_memory.record('a', '1', 'X', 'hello a')
+        chat_memory.record('b', '2', 'Y', 'hello b')
+        self.assertEqual(len(chat_memory.build_history('a')), 1)
+        self.assertEqual(chat_memory.build_history('a')[0]['content'], 'X: hello a')
+        self.assertEqual(chat_memory.build_history('b')[0]['content'], 'Y: hello b')
+
+    def test_old_messages_expire(self):
+        chat_memory.record('c1', '1', 'Alt', 'ancient message')
+        chat_memory.record('c1', '2', 'Alt', 'fresh message')
+        real_time = chat_memory.time.time
+        with patch.object(chat_memory.time, 'time', return_value=real_time() + chat_memory.MAX_AGE_SECONDS + 1):
+            self.assertEqual(chat_memory.build_history('c1'), [])
+
+    def test_buffer_bounded_and_clear(self):
+        for i in range(chat_memory.MAX_MESSAGES + 10):
+            chat_memory.record('c1', str(i), 'U', f'msg {i}')
+        history = chat_memory.build_history('c1', limit=chat_memory.MAX_MESSAGES)
+        self.assertEqual(len(history), chat_memory.MAX_MESSAGES)
+        self.assertNotIn('msg 0', history[0]['content'])
+        chat_memory.clear('c1')
+        self.assertEqual(chat_memory.build_history('c1'), [])
+
+    def test_empty_content_not_recorded(self):
+        chat_memory.record('c1', '1', 'Alt', '<@1546333781764345936>')
+        self.assertEqual(chat_memory.build_history('c1'), [])
+
+    def test_groq_water_chat_passes_history_to_model(self):
+        history = [{'role': 'user', 'content': 'Alt: who taught this model'}]
+        captured = {}
+        def fake_query(messages, **kwargs):
+            captured['messages'] = messages
+            return 'ok'
+        with patch.object(groq_engine, 'query_groq', side_effect=fake_query), \
+             patch.object(groq_engine.water_knowledge, 'search_water_data', return_value=''):
+            groq_engine.groq_water_chat('w opinion', 'Tobalaka', history)
+        msgs = captured['messages']
+        self.assertEqual(msgs[0]['role'], 'system')
+        self.assertIn('CONVERSATION MEMORY', msgs[0]['content'])
+        self.assertEqual(msgs[1], history[0])
+        self.assertEqual(msgs[-1]['content'], 'Tobalaka: w opinion')
 
 
 if __name__ == '__main__':
